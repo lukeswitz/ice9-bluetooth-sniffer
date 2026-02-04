@@ -38,6 +38,7 @@ find_package(HackRF REQUIRED)
 find_package(BladeRF REQUIRED)
 find_package(UHD REQUIRED)
 find_package(Liquid REQUIRED)
+find_package(SoapySDR)  # Optional
 
 # find Wireshark install dir
 execute_process(COMMAND ${CMAKE_C_COMPILER} -dumpmachine
@@ -74,6 +75,9 @@ include_directories(${LIBHACKRF_INCLUDE_DIR})
 include_directories(${LIBBLADERF_INCLUDE_DIR})
 include_directories(${UHD_INCLUDE_DIR})
 include_directories(${LIQUID_INCLUDE_DIR})
+if (SOAPYSDR_FOUND)
+    include_directories(${SOAPYSDR_INCLUDE_DIR})
+endif()
 
 set(SOURCES
     ${PROJECT_SOURCE_DIR}/bladerf.c
@@ -97,6 +101,10 @@ if(USE_VKFFT)
     list(APPEND SOURCES ${PROJECT_SOURCE_DIR}/vkfft/fft.cc)
 else()
     list(APPEND SOURCES ${PROJECT_SOURCE_DIR}/fftw/fft.c)
+endif()
+
+if (SOAPYSDR_FOUND)
+    list(APPEND SOURCES ${PROJECT_SOURCE_DIR}/soapysdr.c)
 endif()
 
 add_executable(ice9-bluetooth
@@ -134,6 +142,11 @@ target_link_libraries(ice9-bluetooth
     ${UHD_LIBRARIES}
     ${LIQUID_LIBRARIES}
 )
+
+if (SOAPYSDR_FOUND)
+    target_link_libraries(ice9-bluetooth PRIVATE ${SOAPYSDR_LIBRARIES})
+    target_compile_definitions(ice9-bluetooth PRIVATE HAVE_SOAPYSDR)
+endif()
 
 set_property(TARGET ice9-bluetooth PROPERTY C_STANDARD 99)
 set_property(TARGET ice9-bluetooth PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)

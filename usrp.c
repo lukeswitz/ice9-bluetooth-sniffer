@@ -98,8 +98,10 @@ void usrp_list(void) {
 
         type = _find("type", usrp_info, pairs);
         serial = _find("serial", usrp_info, pairs);
-        if (type == NULL || serial == NULL)
+        if (type == NULL || serial == NULL) {
+            free(usrp_info);
             continue;
+        }
 
         printf("interface {value=usrp-%s-%s}{display=ICE9 Bluetooth%s}\n", product, serial,
                 strcmp(type, "b200") == 0 ? "" : " (unsupported)");
@@ -111,13 +113,14 @@ void usrp_list(void) {
 }
 
 char *usrp_get_serial(char *name) {
-    char *dash;
+    char *after_prefix, *dash;
     if (strncmp(name, "usrp-", 5) != 0)
         return NULL;
-    dash = strchr(name, '-');
+    after_prefix = name + 5;  // Skip "usrp-" prefix
+    dash = strchr(after_prefix, '-');
     if (dash == NULL)
         return NULL;
-    return dash + 1; // skip the dash
+    return dash + 1; // Skip the product name and dash, return serial
 }
 
 uhd_usrp_handle usrp_setup(char *serial) {
@@ -137,10 +140,12 @@ uhd_usrp_handle usrp_setup(char *serial) {
     if (error)
         errx(1, "Error opening UHD: %u", error);
 
-    // TODO error handling
-    uhd_usrp_set_rx_rate(usrp, samp_rate, 0);
-    uhd_usrp_set_rx_gain(usrp, usrp_gain_val, 0, "");
-    uhd_usrp_set_rx_freq(usrp, &tune_request, 0, &tune_result);
+    if ((error = uhd_usrp_set_rx_rate(usrp, samp_rate, 0)) != UHD_ERROR_NONE)
+        errx(1, "Unable to set USRP sample rate: %u", error);
+    if ((error = uhd_usrp_set_rx_gain(usrp, usrp_gain_val, 0, "")) != UHD_ERROR_NONE)
+        errx(1, "Unable to set USRP gain: %u", error);
+    if ((error = uhd_usrp_set_rx_freq(usrp, &tune_request, 0, &tune_result)) != UHD_ERROR_NONE)
+        errx(1, "Unable to set USRP frequency: %u", error);
     char str[128];
     uhd_tune_result_to_pp_string(&tune_result, str, sizeof(str));
 
@@ -156,8 +161,8 @@ void *usrp_stream_thread(void *arg) {
     void *buf;
     uhd_rx_metadata_error_code_t error_code;
     uhd_stream_args_t stream_args = {
-        .cpu_format = "fc32",
-        .otw_format = "sc16",
+        .cpu_format = "sc8",
+        .otw_format = "sc8",
         .args = "",
         .channel_list = &channel,
         .n_channels = 1
@@ -180,7 +185,7 @@ void *usrp_stream_thread(void *arg) {
     uhd_rx_streamer_issue_stream_cmd(rx_handle, &stream_cmd);
 
     while (running) {
-        sample_buf_t *s = malloc(sizeof(*s) + num_samples * 2 * sizeof(float));
+        sample_buf_t *s = malloc(sizeof(*s) + num_samples * 2 * sizeof(int8_t));
         buf = s->samples;
         uhd_rx_streamer_recv(rx_handle, &buf, num_samples, &md, 3.0, false, &num_rx_samples);
 	uhd_rx_metadata_error_code(md, &error_code);

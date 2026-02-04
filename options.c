@@ -24,11 +24,17 @@
 #include "bladerf.h"
 #include "pcap.h"
 #include "usrp.h"
+#ifdef HAVE_SOAPYSDR
+#include "soapysdr.h"
+#endif
 
 extern FILE *in;
 extern char *serial;
 extern char *usrp_serial;
 extern int bladerf_num;
+#ifdef HAVE_SOAPYSDR
+extern int soapy_num;
+#endif
 
 extern float samp_rate;
 extern unsigned channels;
@@ -47,7 +53,10 @@ static void do_mkdir(char *path) {
 
 static void exe_path(char *out) {
 #ifdef __linux__
-    readlink("/proc/self/exe", out, PATH_MAX);
+    ssize_t len = readlink("/proc/self/exe", out, PATH_MAX - 1);
+    if (len < 0)
+        err(1, "readlink failed");
+    out[len] = '\0';
 #else
     char tmp[PATH_MAX];
     uint32_t size = PATH_MAX;
@@ -86,6 +95,9 @@ static void _print_interfaces(void) {
     hackrf_list();
     bladerf_list();
     usrp_list();
+#ifdef HAVE_SOAPYSDR
+    soapy_list();
+#endif
     exit(0);
 }
 
@@ -148,8 +160,16 @@ void parse_options(int argc, char **argv) {
                     bladerf_num = atoi(optarg + strlen("bladerf"));
                 else if (strstr(optarg, "usrp-") == optarg)
                     usrp_serial = strdup(usrp_get_serial(optarg));
+#ifdef HAVE_SOAPYSDR
+                else if (strstr(optarg, "soapy-") == optarg)
+                    soapy_num = atoi(optarg + strlen("soapy-"));
+#endif
                 else
-                    errx(1, "invalid interface, must start with \"hackrf-\" or \"bladerf\"");
+                    errx(1, "invalid interface, must start with \"hackrf-\", \"bladerf\", \"usrp-\""
+#ifdef HAVE_SOAPYSDR
+                         ", or \"soapy-\""
+#endif
+                    );
                 break;
 
             case 'w':

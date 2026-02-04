@@ -29,6 +29,9 @@
 #include "pcap.h"
 #include "sdr.h"
 #include "usrp.h"
+#ifdef HAVE_SOAPYSDR
+#include "soapysdr.h"
+#endif
 
 #include "pfbch2.h"
 
@@ -57,6 +60,9 @@ FILE *in = NULL;
 char *serial = NULL;
 char *usrp_serial = NULL;
 int bladerf_num = -1;
+#ifdef HAVE_SOAPYSDR
+int soapy_num = -1;
+#endif
 int verbose = 0;
 int stats = 0;
 
@@ -399,7 +405,8 @@ void *burst_processor_thread(void *arg) {
                 FILE *out;
 
                 /* burst */
-                (void)!asprintf(&filename, "%s-%04u-%04u.fc32", base_name, burst->freq, burst->num);
+                if (asprintf(&filename, "%s-%04u-%04u.fc32", base_name, burst->freq, burst->num) < 0)
+                    err(1, "asprintf failed");
                 out = fopen(filename, "w");
                 if (out == NULL)
                     err(1, "Unable to create file %s", filename);
@@ -408,7 +415,8 @@ void *burst_processor_thread(void *arg) {
                 fclose(out);
 
                 /* demoded samples */
-                (void)!asprintf(&filename, "%s-%04u-%04u.f32", base_name, burst->freq, burst->num);
+                if (asprintf(&filename, "%s-%04u-%04u.f32", base_name, burst->freq, burst->num) < 0)
+                    err(1, "asprintf failed");
                 out = fopen(filename, "w");
                 if (out == NULL)
                     err(1, "Unable to create file %s", filename);
@@ -417,7 +425,8 @@ void *burst_processor_thread(void *arg) {
                 fclose(out);
 
                 /* cfo / maybe other metadata? */
-                (void)!asprintf(&filename, "%s-%04u-%04u.txt", base_name, burst->freq, burst->num);
+                if (asprintf(&filename, "%s-%04u-%04u.txt", base_name, burst->freq, burst->num) < 0)
+                    err(1, "asprintf failed");
                 out = fopen(filename, "w");
                 if (out == NULL)
                     err(1, "Unable to create file %s", filename);
@@ -525,6 +534,10 @@ int main(int argc, char **argv) {
     struct bladerf *bladerf = NULL;
     uhd_usrp_handle usrp = NULL;
     pthread_t bladerf_thread, usrp_thread;
+#ifdef HAVE_SOAPYSDR
+    SoapySDRDevice *soapy = NULL;
+    pthread_t soapy_thread;
+#endif
 
     signal(SIGINT, sig);
     signal(SIGTERM, sig);
@@ -542,6 +555,10 @@ int main(int argc, char **argv) {
             bladerf = bladerf_setup(bladerf_num);
         else if (usrp_serial != NULL)
             usrp = usrp_setup(usrp_serial);
+#ifdef HAVE_SOAPYSDR
+        else if (soapy_num >= 0)
+            soapy = soapy_setup(soapy_num);
+#endif
         else
             hackrf = hackrf_setup();
     }
@@ -577,6 +594,10 @@ int main(int argc, char **argv) {
             hackrf_start_rx(hackrf, hackrf_rx_cb, NULL);
         else if (usrp != NULL)
             pthread_create(&usrp_thread, NULL, usrp_stream_thread, (void *)usrp);
+#ifdef HAVE_SOAPYSDR
+        else if (soapy != NULL)
+            pthread_create(&soapy_thread, NULL, soapy_stream_thread, (void *)soapy);
+#endif
         else
             pthread_create(&bladerf_thread, NULL, bladerf_stream_thread, (void *)bladerf);
     }
@@ -593,6 +614,10 @@ int main(int argc, char **argv) {
             hackrf_stop_rx(hackrf);
         else if (usrp != NULL)
             ; // do nothing (stream is stopped in thread)
+#ifdef HAVE_SOAPYSDR
+        else if (soapy != NULL)
+            ; // do nothing (stream is stopped in thread)
+#endif
         else
             bladerf_enable_module(bladerf, BLADERF_MODULE_RX, false);
     }
@@ -606,6 +631,11 @@ int main(int argc, char **argv) {
         } else if (usrp != NULL) {
             pthread_join(usrp_thread, NULL);
             usrp_close(usrp);
+#ifdef HAVE_SOAPYSDR
+        } else if (soapy != NULL) {
+            pthread_join(soapy_thread, NULL);
+            soapy_close(soapy);
+#endif
         } else {
             pthread_join(bladerf_thread, NULL);
             bladerf_close(bladerf);

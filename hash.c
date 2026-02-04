@@ -35,7 +35,16 @@ hash_t *hash_new(unsigned size) {
 }
 
 void hash_destroy(hash_t *h) {
-    // TODO
+    unsigned i;
+    for (i = 0; i < h->size; ++i) {
+        hash_entry_t *e = h->entry[i].next;
+        while (e != &h->entry[i]) {
+            hash_entry_t *next = e->next;
+            free(e);
+            e = next;
+        }
+    }
+    free(h);
 }
 
 // FIXME handle double-insertion

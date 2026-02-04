@@ -47,7 +47,12 @@ int burst_catcher_execute(burst_catcher_t *c, float complex *sample, burst_t *bu
     if (agc_crcf_squelch_get_status(c->agc) == LIQUID_AGC_SQUELCH_SIGNALHI) {
         if (c->burst_len == c->burst_buf_size && c->burst_len < MAX_BURST_SIZE) {
             c->burst_buf_size *= 2;
-            c->burst = realloc(c->burst, sizeof(float complex) * c->burst_buf_size);
+            float complex *new_burst = realloc(c->burst, sizeof(float complex) * c->burst_buf_size);
+            if (new_burst == NULL) {
+                c->burst_buf_size /= 2;  // Revert size, keep existing buffer
+            } else {
+                c->burst = new_burst;
+            }
         }
         if (c->burst_len < MAX_BURST_SIZE)
             c->burst[c->burst_len++] = *sample;
