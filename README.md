@@ -1,14 +1,32 @@
 # ICE9 Bluetooth Sniffer
 
-Wireshark-compatible all-channel Bluetooth sniffer for bladeRF, with
-wideband sniffing (4-60 MHz) for HackRF and USRP.
+Wireshark-compatible Bluetooth sniffer supporting multiple SDR platforms.
+Captures BLE and classic Bluetooth (BR) packets across multiple channels
+simultaneously using a polyphase channelizer.
+
+## Supported Hardware
+
+| SDR | Interface Flag | Bandwidth | Notes |
+|-----|---------------|-----------|-------|
+| bladeRF 2.0 | `-i bladerf0` | Up to 96 MHz (all-channel) | Only device supporting `-a` mode |
+| HackRF One | `-i hackrf-SERIAL` | 4-60 MHz | Default if no `-i` specified |
+| USRP (B200/B210) | `-i usrp-MODEL-SERIAL` | 4-56 MHz | Example: `-i usrp-B210-FCO2P05` |
+| SoapySDR | `-i soapy-N` | 4-60 MHz | Generic SDR support (if compiled with SoapySDR) |
+
+To list available SDR devices:
+
+    ice9-bluetooth --extcap-interfaces
 
 ## Dependencies
 
 This tool requires libliquid, libhackrf, libbladerf, libuhd, and
-libfftw3. On Debian-based systems you can install these using:
+libfftw3. On Debian-based systems:
 
     sudo apt install libliquid-dev libhackrf-dev libbladerf-dev libuhd-dev libfftw3-dev
+
+Optional SoapySDR support:
+
+    sudo apt install libsoapysdr-dev
 
 On macOS, fftw3 is not required and [Homebrew](https://brew.sh/) is the
 recommended package manager:
@@ -33,84 +51,137 @@ on Linux if detected. Use `ice9-bluetooth --install` to install the
 binary into your local extcap dir (`$HOME/.config/wireshark/extcap`). An
 `uninstall` target is also provided as a convenience.
 
-## Running
+## Usage
 
-This tool is primarily meant to be run from within Wireshark. That said,
-it is fully operable from the command line. Refer to the [usage
-notes](help.txt) for full details. For a brief overview, to capture 20
-channels centered on 2427 MHz and log all BLE traffic to a PCAP file:
+### Command-Line Options
 
-    ./ice9-bluetooth -l -c 2427 -C 20 -w ble.pcap
+```
+Mandatory (pick one input source):
+    -f, --file=FILE         Read input from fc32 file
+    -l, --capture           Capture live from SDR
 
-To capture all channels (the default as of 23.06.0) run the following:
+Mandatory (pick one channel mode):
+    -a, --all-channels      All-channel sniffing (96 channels, requires bladeRF 2.0)
+        or
+    -c, --center-freq=FREQ  Center frequency in MHz (2400-2480, default: 2441)
+    -C, --channels=CHAN     Number of channels (4-96, divisible by 4)
 
-    ./ice9-bluetooth -l -i bladerf0 -a -w all_channels.pcap
+Optional:
+    -w, --fifo=OUTPUT       Output pcap to file or FIFO
+    -i IFACE                SDR device to use (see Supported Hardware above)
+    -s, --stats             Print performance stats periodically
+    -v, --verbose           Print detailed info about captured bursts
+    --check-crc             Enable BLE CRC-24 validation
+    -I, --install           Install into Wireshark extcap folder
+```
 
-For performance stats, add `-s`. For low-level details and info about
-classic Bluetooth packets, add `-v`.
+### Examples
+
+Capture 40 channels centered on 2441 MHz using a USRP B210:
+
+    ice9-bluetooth -l -i usrp-B210-FCO2P05 -c 2441 -C 40 -w capture.pcap
+
+Capture using HackRF with performance stats:
+
+    ice9-bluetooth -l -c 2441 -C 20 -w capture.pcap -s
+
+All-channel capture with bladeRF 2.0:
+
+    ice9-bluetooth -l -i bladerf0 -a -w all_channels.pcap
+
+Capture with CRC validation and verbose output:
+
+    ice9-bluetooth -l -c 2441 -C 40 -w capture.pcap --check-crc -v -s
+
+Read from a previously recorded IQ file:
+
+    ice9-bluetooth -f recording.fc32 -c 2441 -C 20 -w output.pcap
+
+### Channel Count Guidelines
+
+The `-C` flag controls how many 2 MHz channels the polyphase channelizer
+creates. More channels = more spectrum coverage = more packets captured,
+but requires more CPU. Each channel is 2 MHz wide.
+
+| Channels | Bandwidth | BLE Coverage | Notes |
+|----------|-----------|--------------|-------|
+| 4 | 4 MHz | ~5% | Minimal, mostly for testing |
+| 20 | 20 MHz | ~25% | Good starting point for HackRF |
+| 40 | 40 MHz | ~50% | Covers half the BLE spectrum |
+| 56 | 56 MHz | ~70% | Near full coverage |
+| 80 | 80 MHz | 100% | Full BLE band (2400-2480 MHz) |
+| 96 | 96 MHz | 100% | Full band with margin (bladeRF only) |
+
+Check if your system can keep up using the `-s` flag. The channelizer
+throughput should show >= 100% realtime.
+
+### Wireshark Integration
 
 To use in Wireshark, plug in your SDR and launch Wireshark. Scroll to the
 bottom of the interfaces list in the main window and you should see "ICE9
-Bluetooth: hackrf-$serial" (or similar) listed. Click the wheel icon to the
-left of it to configure it if you want, but the defaults should get you BLE
+Bluetooth: hackrf-$serial" (or similar) listed. Click the gear icon to
+the left of it to configure, but the defaults should get you BLE
 packets (if your system is fast enough).
 
 ### Benchmarking
 
-There isn't a proper benchmark mode as such, but you can try
-demodulating a bunch of random bytes like so:
+You can benchmark channelizer performance by demodulating random bytes:
 
-    ./ice9-bluetooth -f /dev/urandom -s -C 20
+    ice9-bluetooth -f /dev/urandom -s -C 20
 
-or on macOS:
+On macOS:
 
-    ./ice9-bluetooth -f /dev/random -s -C 20
+    ice9-bluetooth -f /dev/random -s -C 20
 
-The channelizer will be the bottleneck. Start with 20 channels and
-observe the performance relative to real time. If it is not over 100%,
-lower the number of channels until it is. If it is over realtime, keep
-going until you reach 96 channels.
+Start with 20 channels and observe the performance relative to real time.
+Increase the channel count until throughput drops below 100%.
 
-If you do benchmark this code, please share your numbers with me!
+## Technical Details
 
-## Design
+### CRC Validation
 
-    +----------------------------+
-    |  polyphase channelizer     |
-    |  1 x 20 MHz -> 20 x 2 MHz  |
-    +-------+------+-------+-----+
-            |      |       |
-            |      |       |
-            |      |       |
-      +-----v----+ | +-----v-----+
-      | thread 1 | | | thread 2  |
-      +----------+ | +-----------+
-                   |                  output:
-                   | +-----------+    bursts
-          ...      +-> thread 20 |
-                     +-----------+
+The `--check-crc` flag enables BLE CRC-24 validation. This sets the
+appropriate PCAP flags so Wireshark can display CRC status per packet.
+Packets with valid CRCs are marked accordingly; packets with invalid
+CRCs (typically from bit errors due to weak signals) are still captured
+and written to the PCAP file.
 
-             burst queue
-                  |
-                  |
-      +-----------v-------------+
-      |    burst processor      |
-      | FM demod / BT detection |
-      +-------------------------+
+### Architecture
 
-The complex IQ samples come in from file or HackRF and are fed into a
-polyphase channelizer. This splits the n MHz input into n channels at 2
-MHz wide. These channelized samples are fed to n threads that each
-process one channel. Each thread runs a "burst catcher", that uses
-Liquid's AGC to capture bursts on the channel and feeds them via a queue
-to the burst processor.
+```
++----------------------------+
+|  polyphase channelizer     |
+|  1 x N MHz -> N x 2 MHz   |
++-------+------+-------+----+
+        |      |       |
+        |      |       |
+  +-----v----+ | +-----v-----+
+  | thread 1 | | | thread 2  |
+  +----------+ | +-----------+
+               |                  output:
+               | +-----------+    bursts
+      ...      +-> thread N  |
+                 +-----------+
+
+         burst queue
+              |
+  +-----------v-------------+
+  |    burst processor      |
+  | FM demod / BT detection |
+  +-------------------------+
+```
+
+Complex IQ samples come in from file or SDR and are fed into a polyphase
+channelizer. This splits the N MHz input into N channels at 2 MHz wide.
+These channelized samples are fed to N threads that each process one
+channel. Each thread runs a "burst catcher" that uses Liquid's AGC to
+capture bursts and feeds them via a queue to the burst processor.
 
 The burst processor takes the complex IQ bursts, FM demodulates them,
-performs carrier frequency offset (CFO) correction, normalizes them to
-roughly [-1.0, 1.0], bypasses symbol sync (for hysterical reasons), and
-performs hard bit decisions. These bit buffers are fed into the
+performs carrier frequency offset (CFO) correction, normalizes them,
+and performs hard bit decisions. These bit buffers are fed into the
 Bluetooth detectors. First we attempt to detect BR packets using
-libbtbb's techniques (borrowed from Ubertooth and earlier gr-bluetooth).
+libbtbb's techniques (borrowed from Ubertooth and gr-bluetooth).
 If that fails, we then try to detect BLE packets.
 
 ## Bugs
