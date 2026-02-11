@@ -40,6 +40,8 @@ typedef struct __attribute__((packed)) _pcap_le_header_t {
 #define LE_DEWHITENED         0x0001
 #define LE_SIGNAL_POWER_VALID 0x0002
 #define LE_NOISE_POWER_VALID  0x0004
+#define LE_CRC_CHECKED        0x0400  // CRC validation was performed (bit 10)
+#define LE_CRC_VALID          0x0800  // CRC is valid (only meaningful with LE_CRC_CHECKED) (bit 11)
 
 
 #if !defined( DLT_BLUETOOTH_LE_LL_WITH_PHDR )
@@ -75,11 +77,21 @@ void pcap_close(pcap_t *p) {
 
 // TODO timestamp
 void pcap_write_ble(pcap_t *p, ble_packet_t *b) {
+    uint16_t flags = LE_DEWHITENED | LE_SIGNAL_POWER_VALID | LE_NOISE_POWER_VALID;
+
+    // Add CRC flags if checked
+    if (b->crc_checked) {
+        flags |= LE_CRC_CHECKED;
+        if (b->crc_valid) {
+            flags |= LE_CRC_VALID;
+        }
+    }
+
     pcap_le_header_t le_header = {
         .rf_channel = (b->freq - 2402) / 2,
         .signal_power = b->rssi_db,
         .noise_power = b->noise_db,
-        .flags = LE_DEWHITENED | LE_SIGNAL_POWER_VALID | LE_NOISE_POWER_VALID,
+        .flags = flags,
     };
     pcaprec_hdr_t pcap_header = {
         .ts_sec   = b->timestamp.tv_sec,

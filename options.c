@@ -43,6 +43,7 @@ extern pcap_t *pcap;
 extern int live;
 extern int verbose;
 extern int stats;
+extern int check_crc;
 
 void usage(int exitcode);
 
@@ -139,11 +140,12 @@ void parse_options(int argc, char **argv) {
         { "help", no_argument, NULL, 'h' },
         { "verbose", no_argument, NULL, 'v' },
         { "stats", no_argument, NULL, 's' },
+        { "check-crc", no_argument, NULL, 'r' },
         { "install", no_argument, NULL, 'I' },
         { NULL,         0,                      NULL,           0 }
     };
 
-    while ((ch = getopt_long(argc, argv, "li:w:C:c:f:aIvsh", longopts, NULL)) != -1) {
+    while ((ch = getopt_long(argc, argv, "li:w:C:c:f:aIvsrh", longopts, NULL)) != -1) {
         switch (ch) {
             case 0:
                 // long opt
@@ -202,6 +204,10 @@ void parse_options(int argc, char **argv) {
 
             case 's':
                 stats = 1;
+                break;
+
+            case 'r':
+                check_crc = 1;
                 break;
 
             case 'I':

@@ -65,6 +65,11 @@ int soapy_num = -1;
 #endif
 int verbose = 0;
 int stats = 0;
+int check_crc = 0;
+
+unsigned long crc_total = 0;
+unsigned long crc_valid_count = 0;
+unsigned long crc_invalid_count = 0;
 
 volatile sig_atomic_t running = 1;
 pid_t self_pid;
@@ -229,6 +234,11 @@ void agc_submit(float complex *fft_out) {
                 printf("AGC is too slow, use fewer channels\n");
             if (ch_rel_rate < 0.99)
                 printf("Channelizer too slow, use fewer channels\n");
+            if (check_crc && crc_total > 0) {
+                double valid_pct = (100.0 * crc_valid_count) / crc_total;
+                printf("CRC: %lu valid, %lu invalid (%.1f%% valid)\n",
+                       crc_valid_count, crc_invalid_count, valid_pct);
+            }
             sum_count = sum = ch_sum = 0;
         }
         agc_start = now_us();
@@ -388,7 +398,7 @@ void *burst_processor_thread(void *arg) {
 
         if (burst->packet.demod != NULL && burst->packet.bits != NULL) {
             uint32_t lap = 0xffffffff, aa = 0xffffffff;
-            bluetooth_detect(burst->packet.bits, burst->packet.bits_len, burst->freq, burst->rssi_db, burst->noise_db, burst->timestamp, &lap, &aa);
+            bluetooth_detect(burst->packet.bits, burst->packet.bits_len, burst->packet.demod, burst->len, burst->packet.silence, burst->freq, burst->rssi_db, burst->noise_db, burst->timestamp, &lap, &aa);
 
             if (verbose) {
                 printf("burst %4u-%04u, %d samps, rssi %f dB, noise %f dB ", burst->freq, burst->num, burst->len, burst->rssi_db, burst->noise_db);
@@ -563,6 +573,7 @@ int main(int argc, char **argv) {
             hackrf = hackrf_setup();
     }
     gen_syndrome_map(1);
+    bluetooth_init();
 
     unsigned h_len = 2*channels*m + 1;
     float *h = malloc(sizeof(float) * h_len);

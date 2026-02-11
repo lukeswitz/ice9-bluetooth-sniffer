@@ -8,7 +8,8 @@
 #include <stdint.h>
 #include <time.h>
 
-void bluetooth_detect(uint8_t *bits, unsigned len, unsigned freq, unsigned rssi, unsigned noise, struct timespec timestamp, uint32_t *lap_out, uint32_t *aa_out);
+void bluetooth_init(void);
+void bluetooth_detect(uint8_t *bits, unsigned len, float *demod, unsigned demod_len, unsigned silence_offset, unsigned freq, unsigned rssi, unsigned noise, struct timespec timestamp, uint32_t *lap_out, uint32_t *aa_out);
 
 typedef struct _ble_packet_t {
     uint32_t aa;
@@ -17,6 +18,8 @@ typedef struct _ble_packet_t {
     unsigned freq; // frequency in MHz
     unsigned len; // length including AA + header + CRC
     struct timespec timestamp;
+    uint8_t crc_checked;    // Was CRC validation performed?
+    uint8_t crc_valid;      // Is CRC valid? (only meaningful if crc_checked)
     uint8_t data[0]; // data starts at AA
 } ble_packet_t;
 
