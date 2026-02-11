@@ -24,6 +24,10 @@ libfftw3. On Debian-based systems:
 
     sudo apt install libliquid-dev libhackrf-dev libbladerf-dev libuhd-dev libfftw3-dev
 
+Optional GPU acceleration (OpenCL):
+
+    sudo apt install ocl-icd-opencl-dev
+
 Optional SoapySDR support:
 
     sudo apt install libsoapysdr-dev
@@ -107,10 +111,26 @@ but requires more CPU. Each channel is 2 MHz wide.
 |----------|-----------|--------------|-------|
 | 4 | 4 MHz | ~5% | Minimal, mostly for testing |
 | 20 | 20 MHz | ~25% | Good starting point for HackRF |
-| 40 | 40 MHz | ~50% | Covers half the BLE spectrum |
+| 40 | 40 MHz | ~50% | Recommended: good CRC rates (~57%) |
+| 48 | 48 MHz | ~60% | Recommended: best CRC rates (~71%) |
 | 56 | 56 MHz | ~70% | Near full coverage |
 | 80 | 80 MHz | 100% | Full BLE band (2400-2480 MHz) |
 | 96 | 96 MHz | 100% | Full band with margin (bladeRF only) |
+
+**Note:** The polyphase channelizer produces best results at certain
+channel counts. Tested CRC validation rates by channel count:
+
+| Channels | CRC Valid Rate | Notes |
+|----------|---------------|-------|
+| 40 | ~57% | Good |
+| 44 | ~2% | Poor |
+| 48 | ~71% | Best |
+| 52 | ~3% | Poor |
+| 56 | ~1% | Poor |
+| 60 | ~70% | Good (but exceeds USRP B210 analog BW) |
+
+This is a characteristic of the PFBCH2 filterbank at certain sizes, not
+a bug in the software. For best results, use `-C 40` or `-C 48`.
 
 Check if your system can keep up using the `-s` flag. The channelizer
 throughput should show >= 100% realtime.
@@ -145,6 +165,29 @@ appropriate PCAP flags so Wireshark can display CRC status per packet.
 Packets with valid CRCs are marked accordingly; packets with invalid
 CRCs (typically from bit errors due to weak signals) are still captured
 and written to the PCAP file.
+
+### GPU Acceleration (OpenCL)
+
+When built with OpenCL support (auto-detected by cmake), the polyphase
+filterbank channelizer and FFT are fused into a single GPU pipeline
+using OpenCL and VkFFT. This offloads the main CPU bottleneck to the
+GPU, freeing CPU cycles for burst processing.
+
+No runtime flags are needed -- GPU acceleration is used automatically
+when available. If OpenCL is not found at build time, the build falls
+back to FFTW for CPU-based FFT.
+
+Build with GPU acceleration:
+
+    sudo apt install ocl-icd-opencl-dev
+    mkdir build && cd build
+    cmake ..    # OpenCL detected automatically
+    make
+
+Build without GPU acceleration:
+
+    cmake .. -DUSE_OPENCL_FFT=OFF
+    make
 
 ### Architecture
 

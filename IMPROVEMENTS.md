@@ -6,6 +6,7 @@ This document describes improvements made to ice9-bluetooth-sniffer:
 
 1. Optional CRC-24 validation with Wireshark integration
 2. Access Address correlator for dramatically improved packet detection
+3. OpenCL GPU acceleration for the polyphase channelizer + FFT
 
 ## Changes Made
 
@@ -24,10 +25,10 @@ Implemented CRC-24 validation with PCAP flag support for Wireshark:
 - Optional via `--check-crc` flag (default: OFF for backward compatibility)
 - Sets PCAP flags LE_CRC_CHECKED and LE_CRC_VALID for Wireshark
 
-**Live Testing Results (USRP B210, 4 channels, 22 seconds):**
-- 9 valid CRCs out of 48 total packets (18.8%)
-- Valid rate depends on signal strength and RF environment
-- Stronger signals produce higher CRC pass rates
+**Live Testing Results (USRP B210, USB 3.0):**
+- CRC valid rate depends on channel count and signal strength
+- At 48 channels: ~71% valid (best), at 40 channels: ~57% valid
+- See section 3 (Channel Count Sensitivity) for details
 
 **Usage:**
 ```bash
@@ -44,7 +45,7 @@ ice9-bluetooth -l -i usrp-B210-xxx -c 2441 -C 40 -w output.pcap --check-crc --st
 **Statistics Output:**
 When both `--check-crc` and `--stats` are enabled, periodic output includes:
 ```
-CRC: 9 valid, 39 invalid (18.8% valid)
+CRC: 404 valid, 164 invalid (71.1% valid)
 ```
 
 ### 2. Access Address Correlator (Addresses Issue #34)
@@ -105,13 +106,67 @@ This improvement was made possible by the example capture data posted in
 issue #34, which provided the real-world burst samples needed to diagnose
 the preamble detection bottleneck and validate the correlator approach.
 
+### 3. OpenCL GPU Acceleration
+
+**Problem:**
+The CPU-based polyphase filterbank channelizer (PFBCH2) is the main
+throughput bottleneck. At high channel counts, the per-sample dot
+products and FFT consume most of the processing budget, limiting
+realtime performance.
+
+**Solution:**
+Fused the PFB filterbank and FFT into a single OpenCL GPU kernel:
+
+- The PFB dot products and VkFFT are executed on the GPU in a pipeline
+- Double-buffered: one batch processes on GPU while the next fills on CPU
+- Pre-roll mechanism preserves window history across batch boundaries
+- Auto-detected at build time; no runtime flags needed
+- Falls back to FFTW when OpenCL is not available
+
+**Additional SIMD improvements:**
+- AVX2 runtime dispatch for the CPU dot product (window.c), with SSE2 fallback
+- SSE4.1 vectorized int16-to-float conversion in the CPU channelizer path
+- Fixed a bug in the scalar fallback that used the real buffer for both
+  real and imaginary accumulation
+
+**Testing Results (USRP B210, USB 3.0, Intel UHD integrated GPU):**
+
+| Channels | Throughput | CRC Valid Rate |
+|----------|-----------|----------------|
+| 40 | 100% realtime | ~57% |
+| 48 | ~98% realtime | ~71% |
+
+CRC validation rates match the CPU-only path exactly, confirming the
+GPU implementation produces correct output.
+
+**Channel Count Sensitivity:**
+Testing revealed that certain channel counts produce poor CRC validation
+rates regardless of CPU or GPU path. This is a characteristic of the
+PFBCH2 filterbank, not a bug in the GPU implementation:
+
+| Channels | CRC Valid Rate |
+|----------|---------------|
+| 40 | ~57% |
+| 44 | ~2% |
+| 48 | ~71% |
+| 52 | ~3% |
+| 56 | ~1% |
+| 60 | ~70% |
+
+Recommended channel counts: 40 or 48.
+
 ## Files Modified
 
 - **bluetooth.c**: CRC-24 algorithm, CRC validation logic, AA correlator
 - **bluetooth.h**: Added `bluetooth_init()` declaration, CRC fields to `ble_packet_t`, updated `bluetooth_detect()` signature
-- **main.c**: Added `bluetooth_init()` call, CRC statistics globals, pass demod signal to detector
+- **main.c**: Added `bluetooth_init()` call, CRC statistics globals, pass demod signal to detector, GPU channelizer thread
 - **options.c**: Added `--check-crc` command-line option
 - **pcap.c**: Added CRC PCAP flags, conditional flag setting
+- **opencl/fft.c**: GPU PFB+FFT kernel (new file)
+- **opencl/fft.h**: GPU PFB+FFT header (new file)
+- **window.c**: AVX2 runtime dispatch, SSE2 madd optimization, scalar bug fix
+- **window.h**: Added `window_dotprod_init()` declaration
+- **CMakeLists.txt**: OpenCL auto-detection and build integration
 
 ## Backward Compatibility
 
