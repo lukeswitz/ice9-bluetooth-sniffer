@@ -12,10 +12,21 @@ Mandatory arguments:
 
 Optional arguments:
     -w, --fifo=OUTPUT       output pcap to OUTPUT (may be a pcap file or FIFO)
+    -r, --check-crc         validate BLE CRC-24 and set PCAP flags
     -s, --stats             print performance stats periodically
     -v, --verbose           print detailed info about captured bursts
     -i IFACE                which SDR to use, example: hackrf-1234abcd
     -I, --install           install into Wireshark extcap folder
+
+GPU acceleration:
+    When built with OpenCL support, the polyphase filterbank channelizer and
+    FFT are offloaded to the GPU automatically. No flags are needed. Falls
+    back to FFTW on systems without OpenCL.
+
+Channel count notes:
+    The PFBCH2 channelizer works best with certain channel counts. Recommended
+    values are 40 and 48. Other counts (e.g. 44, 52, 56) may produce poor CRC
+    validation rates due to characteristics of the filterbank at those sizes.
 
 This tool also supports the Wireshark extcap interface:
     ice9-bluetooth --extcap-interfaces
