@@ -35,6 +35,11 @@
 
 #include "pfbch2.h"
 
+#ifdef USE_OPENCL_PFB
+void init_pfb_gpu(int16_t *h_sub, unsigned M, unsigned m, unsigned h_sub_len);
+int8_t *get_next_raw_buffer(void);
+#endif
+
 #define C_FEK_BLOCKING_QUEUE_IMPLEMENTATION
 #define C_FEK_FAIR_LOCK_IMPLEMENTATION
 #include "blocking_queue.h"
@@ -117,23 +122,45 @@ pthread_t burst_processor;
 
 pthread_t spewer;
 
+// vectorized int16 -> float complex conversion
+#if defined(__SSE4_1__)
+#include <smmintrin.h>
+static inline void convert_i16_to_fc(int16_t *in, float complex *out, unsigned n) {
+    unsigned i = 0;
+    const __m128 scale = _mm_set1_ps(1.0f / 32768.0f);
+
+    /* process 2 complex values per iteration (4 int16 -> 4 float) */
+    for (; i + 2 <= n; i += 2) {
+        __m128i v16 = _mm_loadl_epi64((__m128i*)&in[2*i]);
+        __m128i v32 = _mm_cvtepi16_epi32(v16);
+        __m128 vf = _mm_mul_ps(_mm_cvtepi32_ps(v32), scale);
+        _mm_storeu_ps((float*)&out[i], vf);
+    }
+    /* handle odd remainder */
+    for (; i < n; ++i)
+        out[i] = in[2*i] / 32768.f + in[2*i + 1] / 32768.f * I;
+}
+#else
+static inline void convert_i16_to_fc(int16_t *in, float complex *out, unsigned n) {
+    unsigned i;
+    for (i = 0; i < n; ++i)
+        out[i] = in[2*i] / 32768.f + in[2*i + 1] / 32768.f * I;
+}
+#endif
+
 // special case for all channels
 void pfbch_execute_block_96(int8_t *samples, float complex *buf, unsigned buf_pos) {
-    unsigned i;
-    int16_t out[96*2]; // FIXME (max number of channels we support)
+    int16_t out[96*2];
 
     pfbch2_execute(&magic, samples, out);
-    for (i = 0; i < 96; ++i)
-        buf[96 * buf_pos + i] = out[2*i] / 32768.f + out[2*i + 1] / 32768.f * I;
+    convert_i16_to_fc(out, &buf[96 * buf_pos], 96);
 }
 
 void pfbch_execute_block(int8_t *samples, float complex *buf, unsigned buf_pos) {
-    unsigned i;
-    int16_t out[96*2]; // FIXME (max number of channels we support)
+    int16_t out[96*2];
 
     pfbch2_execute(&magic, samples, out);
-    for (i = 0; i < channels; ++i)
-        buf[channels * buf_pos + i] = out[2*i] / 32768.f + out[2*i + 1] / 32768.f * I;
+    convert_i16_to_fc(out, &buf[channels * buf_pos], channels);
 }
 
 void push_samples(sample_buf_t *buf) {
@@ -269,6 +296,45 @@ void *agc_dispatcher_thread(void *arg) {
 }
 #endif
 
+#ifdef USE_OPENCL_PFB
+void *channelizer_thread(void *arg) {
+    sample_buf_t *samples = NULL;
+    int8_t *raw_buf = get_next_raw_buffer();
+    unsigned raw_pos = 0;
+    unsigned stride = channels;  /* M/2 complex int8 pairs = M bytes */
+
+    while (running) {
+        if (blocking_queue_take(&samples_queue, &samples) != 0)
+            return NULL;
+
+        /* total steps in this sample buffer */
+        unsigned total_steps = samples->num / (channels / 2);
+        unsigned src_pos = 0;
+
+        while (running && src_pos < total_steps) {
+            /* copy as many steps as fit in current batch */
+            unsigned remaining_in_batch = BATCH_SIZE - raw_pos;
+            unsigned remaining_in_src = total_steps - src_pos;
+            unsigned chunk = remaining_in_batch < remaining_in_src
+                           ? remaining_in_batch : remaining_in_src;
+
+            memcpy(&raw_buf[raw_pos * stride],
+                   &samples->samples[src_pos * stride],
+                   chunk * stride);
+            raw_pos += chunk;
+            src_pos += chunk;
+
+            if (raw_pos == BATCH_SIZE) {
+                raw_buf = get_next_raw_buffer();
+                raw_pos = 0;
+            }
+        }
+
+        free(samples);
+    }
+    return NULL;
+}
+#else
 void *channelizer_thread(void *arg) {
     unsigned i;
     sample_buf_t *samples = NULL;
@@ -303,6 +369,7 @@ void *channelizer_thread(void *arg) {
     }
     return NULL;
 }
+#endif
 
 void *agc_thread(void *id_ptr) {
     unsigned id = (uintptr_t)id_ptr;
@@ -574,11 +641,15 @@ int main(int argc, char **argv) {
     }
     gen_syndrome_map(1);
     bluetooth_init();
+    window_dotprod_init();
 
     unsigned h_len = 2*channels*m + 1;
     float *h = malloc(sizeof(float) * h_len);
     liquid_firdes_kaiser(h_len, lp_cutoff/(float)channels, 60.0f, 0.0f, h);
     pfbch2_init(&magic, channels, m, h);
+#ifdef USE_OPENCL_PFB
+    init_pfb_gpu(magic.h_sub, channels, m, magic.h_sub_len);
+#endif
     init_fft(channels, BATCH_SIZE);
     free(h);
 
