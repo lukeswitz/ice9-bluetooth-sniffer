@@ -320,7 +320,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 running = True
 
 
-def zmq_receiver(endpoints, server_key_path, pcap_file, use_gps):
+def zmq_receiver(endpoints, server_key_path, pcap_file, use_gps, bind_mode=False):
     ctx = zmq.Context()
     sub = ctx.socket(zmq.SUB)
     sub.setsockopt(zmq.SUBSCRIBE, b"")
@@ -334,8 +334,12 @@ def zmq_receiver(endpoints, server_key_path, pcap_file, use_gps):
         sub.setsockopt(zmq.CURVE_SECRETKEY, client_secret)
 
     for ep in endpoints:
-        sub.connect(ep)
-        print(f"  Connected to {ep}", file=sys.stderr)
+        if bind_mode:
+            sub.bind(ep)
+            print(f"  Listening on {ep} (bind mode)", file=sys.stderr)
+        else:
+            sub.connect(ep)
+            print(f"  Connected to {ep}", file=sys.stderr)
 
     while running:
         try:
@@ -624,6 +628,8 @@ def main():
                         help="Enable GPS column and map display")
     parser.add_argument("--server-key", metavar="FILE",
                         help="Server public key file for CURVE encryption")
+    parser.add_argument("--bind", action="store_true",
+                        help="Bind SUB socket (sensors connect to us) instead of connecting")
     args = parser.parse_args()
 
     gps_enabled = args.gps
@@ -647,7 +653,7 @@ def main():
     # Start ZMQ receiver thread
     zmq_thread = threading.Thread(
         target=zmq_receiver,
-        args=(args.endpoints, args.server_key, pcap_file, args.gps),
+        args=(args.endpoints, args.server_key, pcap_file, args.gps, args.bind),
         daemon=True,
     )
     zmq_thread.start()

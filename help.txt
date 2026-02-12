@@ -17,7 +17,8 @@ Optional arguments:
     -v, --verbose           print detailed info about captured bursts
     -i IFACE                which SDR to use, example: hackrf-1234abcd
     -I, --install           install into Wireshark extcap folder
-    -Z, --zmq-pub=ENDPOINT  publish packets via ZMQ PUB (e.g. tcp://*:5555)
+    -Z, --zmq-pub=ENDPOINT  publish packets via ZMQ PUB bind (e.g. tcp://*:5555)
+    -X, --zmq-connect=ENDPOINT  publish via ZMQ PUB connect (collector mode)
     -K, --zmq-curve-key=FILE  enable CURVE encryption using key file
     -G, --gpsd              tag packets with GPS coordinates from gpsd
 
@@ -46,8 +47,16 @@ ZMQ packet streaming (requires libzmq):
     Publishes each captured BLE packet as a PCAP record over a ZMQ PUB socket.
     Subscribers receive the standard PCAP packet header + BLE RF Info header +
     payload. Use for distributed sensors, remote monitoring, or custom tooling.
-    Example:
+    Two modes:
+      --zmq-pub (bind):     sensor listens, subscribers connect to it
+      --zmq-connect (connect): sensor connects to a central collector
+    Example (sensor binds, subscriber connects):
         ice9-bluetooth -l -i usrp-... -C 60 --zmq-pub tcp://*:5555
+        python3 tools/zmq_subscriber.py tcp://sensor:5555
+    Example (collector binds, sensors connect):
+        python3 tools/zmq_subscriber.py tcp://*:5555 --bind
+        ice9-bluetooth -l ... --zmq-connect tcp://collector:5555
+        ice9-bluetooth -l ... --zmq-connect tcp://collector:5555   # more sensors
     Encrypted:
         python3 tools/zmq_keygen.py server.key
         ice9-bluetooth -l ... --zmq-pub tcp://*:5555 --zmq-curve-key server.key
