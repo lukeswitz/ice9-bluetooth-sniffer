@@ -115,9 +115,10 @@ products and FFT consume most of the processing budget, limiting
 realtime performance.
 
 **Solution:**
-Fused the PFB filterbank and FFT into a single OpenCL GPU kernel:
+Moved both the PFB filterbank and FFT to the GPU, running in a pipeline:
 
-- The PFB dot products and VkFFT are executed on the GPU in a pipeline
+- Custom OpenCL kernel for PFB dot products, followed by VkFFT for the FFT
+- Both run on the GPU in the same command queue; data stays in GPU memory
 - Double-buffered: one batch processes on GPU while the next fills on CPU
 - Pre-roll mechanism preserves window history across batch boundaries
 - Auto-detected at build time; no runtime flags needed
@@ -129,31 +130,65 @@ Fused the PFB filterbank and FFT into a single OpenCL GPU kernel:
 - Fixed a bug in the scalar fallback that used the real buffer for both
   real and imaginary accumulation
 
-**Testing Results (USRP B210, USB 3.0, Intel UHD integrated GPU):**
+**Testing Results (USRP B210, USB 3.0):**
+
+*Intel UHD integrated GPU:*
 
 | Channels | Throughput | CRC Valid Rate |
 |----------|-----------|----------------|
 | 40 | 100% realtime | ~57% |
 | 48 | ~98% realtime | ~71% |
 
+*NVIDIA GeForce RTX 3060 Laptop GPU:*
+
+| Channels | Throughput | CRC Valid Rate |
+|----------|-----------|----------------|
+| 48 | 100% realtime | ~75% |
+| 52 | 100% realtime | ~3% |
+| 56 | 100% realtime | ~1.5% |
+| 60 | 100% realtime | ~82% |
+
+With the RTX 3060, the GPU has significant headroom (AGC reports 300%+
+realtime). The channelizer is no longer the bottleneck at any channel
+count the USRP B210 supports.
+
 CRC validation rates match the CPU-only path exactly, confirming the
 GPU implementation produces correct output.
+
+**GPU Compatibility:**
+The implementation uses standard OpenCL 1.2 and should work with any
+OpenCL-capable GPU:
+- **NVIDIA**: Requires proprietary driver (includes OpenCL ICD). Tested.
+- **AMD**: Should work via ROCm or AMDGPU-PRO driver. Not yet tested.
+- **Intel**: Works with Intel OpenCL runtime (intel-opencl-icd). Tested.
+
+On Linux, ensure the appropriate OpenCL ICD is installed:
+```bash
+# NVIDIA (installed with driver)
+ls /etc/OpenCL/vendors/nvidia.icd
+
+# AMD
+sudo apt install rocm-opencl-icd    # or amdgpu-pro
+
+# Intel
+sudo apt install intel-opencl-icd
+```
 
 **Channel Count Sensitivity:**
 Testing revealed that certain channel counts produce poor CRC validation
 rates regardless of CPU or GPU path. This is a characteristic of the
 PFBCH2 filterbank, not a bug in the GPU implementation:
 
-| Channels | CRC Valid Rate |
-|----------|---------------|
-| 40 | ~57% |
-| 44 | ~2% |
-| 48 | ~71% |
-| 52 | ~3% |
-| 56 | ~1% |
-| 60 | ~70% |
+| Channels | CRC Valid Rate | Notes |
+|----------|---------------|-------|
+| 40 | ~57% | Good |
+| 44 | ~2% | Poor |
+| 48 | ~71% | Good |
+| 52 | ~3% | Poor |
+| 56 | ~1.5% | Poor |
+| 60 | ~82% | Best (slightly exceeds B210 analog BW) |
 
-Recommended channel counts: 40 or 48.
+Recommended channel counts: 40, 48, or 60 (with capable GPU).
 
 ## Files Modified
 

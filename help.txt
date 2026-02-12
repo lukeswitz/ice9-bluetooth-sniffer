@@ -25,8 +25,8 @@ GPU acceleration:
 
 Channel count notes:
     The PFBCH2 channelizer works best with certain channel counts. Recommended
-    values are 40 and 48. Other counts (e.g. 44, 52, 56) may produce poor CRC
-    validation rates due to characteristics of the filterbank at those sizes.
+    values are 40, 48, and 60. Other counts (e.g. 44, 52, 56) may produce poor
+    CRC validation rates due to characteristics of the filterbank at those sizes.
 
 This tool also supports the Wireshark extcap interface:
     ice9-bluetooth --extcap-interfaces

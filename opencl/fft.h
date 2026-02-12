@@ -1,6 +1,6 @@
 /*
- * Copyright 2025 CEMAXECUTER LLC
- * OpenCL fused PFB + FFT backend header
+ * Copyright 2025-2026 CEMAXECUTER LLC
+ * OpenCL PFB + FFT backend header
  */
 
 #pragma once

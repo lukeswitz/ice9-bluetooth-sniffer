@@ -112,8 +112,9 @@ but requires more CPU. Each channel is 2 MHz wide.
 | 4 | 4 MHz | ~5% | Minimal, mostly for testing |
 | 20 | 20 MHz | ~25% | Good starting point for HackRF |
 | 40 | 40 MHz | ~50% | Recommended: good CRC rates (~57%) |
-| 48 | 48 MHz | ~60% | Recommended: best CRC rates (~71%) |
+| 48 | 48 MHz | ~60% | Recommended: good CRC rates (~71%) |
 | 56 | 56 MHz | ~70% | Near full coverage |
+| 60 | 60 MHz | ~75% | Recommended: best CRC rates (~82%), needs discrete GPU |
 | 80 | 80 MHz | 100% | Full BLE band (2400-2480 MHz) |
 | 96 | 96 MHz | 100% | Full band with margin (bladeRF only) |
 
@@ -124,13 +125,13 @@ channel counts. Tested CRC validation rates by channel count:
 |----------|---------------|-------|
 | 40 | ~57% | Good |
 | 44 | ~2% | Poor |
-| 48 | ~71% | Best |
+| 48 | ~71% | Good |
 | 52 | ~3% | Poor |
-| 56 | ~1% | Poor |
-| 60 | ~70% | Good (but exceeds USRP B210 analog BW) |
+| 56 | ~1.5% | Poor |
+| 60 | ~82% | Best (slightly exceeds B210 analog BW) |
 
 This is a characteristic of the PFBCH2 filterbank at certain sizes, not
-a bug in the software. For best results, use `-C 40` or `-C 48`.
+a bug in the software. For best results, use `-C 40`, `-C 48`, or `-C 60`.
 
 Check if your system can keep up using the `-s` flag. The channelizer
 throughput should show >= 100% realtime.
@@ -169,8 +170,8 @@ and written to the PCAP file.
 ### GPU Acceleration (OpenCL)
 
 When built with OpenCL support (auto-detected by cmake), the polyphase
-filterbank channelizer and FFT are fused into a single GPU pipeline
-using OpenCL and VkFFT. This offloads the main CPU bottleneck to the
+filterbank channelizer and FFT are run entirely on the GPU using
+OpenCL and VkFFT. This offloads the main CPU bottleneck to the
 GPU, freeing CPU cycles for burst processing.
 
 No runtime flags are needed -- GPU acceleration is used automatically
@@ -188,6 +189,13 @@ Build without GPU acceleration:
 
     cmake .. -DUSE_OPENCL_FFT=OFF
     make
+
+The GPU backend uses standard OpenCL 1.2 and works with NVIDIA
+(proprietary driver), AMD (ROCm or AMDGPU-PRO), and Intel (intel-opencl-icd)
+GPUs. On Linux, ensure the appropriate OpenCL ICD is installed for your GPU.
+
+Tested on NVIDIA GeForce RTX 3060 (100% realtime at 60 channels, 300%+
+AGC headroom) and Intel UHD integrated graphics (~98% realtime at 48 channels).
 
 ### Architecture
 

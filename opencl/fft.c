@@ -1,6 +1,6 @@
 /*
- * Copyright 2025 CEMAXECUTER LLC
- * OpenCL fused PFB + FFT backend using VkFFT
+ * Copyright 2025-2026 CEMAXECUTER LLC
+ * OpenCL PFB + FFT backend using VkFFT
  *
  * Runs the polyphase filterbank channelizer and FFT entirely on GPU,
  * eliminating the CPU PFB bottleneck. The host just stages raw int8
@@ -338,10 +338,18 @@ void init_pfb_gpu(int16_t *h_sub, unsigned M, unsigned m, unsigned h_sub_len) {
 
     /* pre-roll buffer (zeros at startup = zero-initialized windows) */
     pre_roll_buf = calloc(1, pre_roll_bytes);
+    if (!pre_roll_buf) {
+        fprintf(stderr, "Failed to allocate pre-roll buffer\n");
+        return;
+    }
 
     /* save coefficients for upload after OpenCL context is created */
     saved_h_sub_count = M * h_sub_len;
     saved_h_sub = malloc(saved_h_sub_count * sizeof(int16_t));
+    if (!saved_h_sub) {
+        fprintf(stderr, "Failed to allocate coefficient buffer\n");
+        return;
+    }
     memcpy(saved_h_sub, h_sub, saved_h_sub_count * sizeof(int16_t));
 
     fprintf(stderr, "GPU PFB: M=%u h_sub_len=%u pre_roll=%u initial_flag=%u\n",
@@ -351,6 +359,10 @@ void init_pfb_gpu(int16_t *h_sub, unsigned M, unsigned m, unsigned h_sub_len) {
 static void upload_pfb_coefficients(void) {
     cl_int err;
     float *h_sub_float = malloc(saved_h_sub_count * sizeof(float));
+    if (!h_sub_float) {
+        fprintf(stderr, "Failed to allocate PFB coefficient buffer\n");
+        return;
+    }
     for (unsigned i = 0; i < saved_h_sub_count; i++)
         h_sub_float[i] = (float)saved_h_sub[i] / 32768.0f;
 
@@ -457,4 +469,50 @@ void release_buffer(void *fft_in) {
     f->buffer_state = BUFFER_STATE_READY;
     pthread_cond_signal(&f->state_cond);
     pthread_mutex_unlock(&f->mutex);
+}
+
+/* ------------------------------------------------------------------ */
+/* Cleanup                                                             */
+/* ------------------------------------------------------------------ */
+static void cleanup_fft_context(fft_context_t *f) {
+    if (f->cl_fft_buffer) clReleaseMemObject(f->cl_fft_buffer);
+    if (f->cl_raw_buffer) clReleaseMemObject(f->cl_raw_buffer);
+    if (f->queue) clReleaseCommandQueue(f->queue);
+    free(f->fft_host_ptr);
+    free(f->raw_host_ptr);
+    deleteVkFFT(&f->app);
+    pthread_mutex_destroy(&f->mutex);
+    pthread_cond_destroy(&f->state_cond);
+}
+
+void deinit_vkfft(void) {
+    /*
+     * Best-effort cleanup. The worker thread may be blocked inside a
+     * GPU operation (clFinish, VkFFTAppend) that won't return until
+     * the current batch completes, so we can't reliably join it.
+     * Cancel and detach instead -- the OS will reclaim GPU resources
+     * on process exit.
+     */
+    pthread_cancel(fft_worker_thread);
+    pthread_detach(fft_worker_thread);
+
+    /* Free host-side allocations */
+    free(pre_roll_buf);
+    pre_roll_buf = NULL;
+
+    for (unsigned i = 0; i < NUM_FFT; i++) {
+        free(fft_ctx[i].fft_host_ptr);
+        fft_ctx[i].fft_host_ptr = NULL;
+        free(fft_ctx[i].raw_host_ptr);
+        fft_ctx[i].raw_host_ptr = NULL;
+        pthread_mutex_destroy(&fft_ctx[i].mutex);
+        pthread_cond_destroy(&fft_ctx[i].state_cond);
+    }
+
+    /*
+     * OpenCL objects (cl_mem, cl_context, cl_kernel, cl_program) and
+     * VkFFT applications are left for the driver to clean up on exit.
+     * Releasing them while the worker thread may still reference them
+     * would be a use-after-free.
+     */
 }
