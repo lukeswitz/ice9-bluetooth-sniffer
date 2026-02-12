@@ -18,4 +18,11 @@ int zmq_pub_init(const char *endpoint, const char *curve_keyfile);
 void zmq_pub_close(void);
 #endif
 
+/* ZMQ GPS frame structure (sent as frame 1 of multipart message) */
+typedef struct __attribute__((packed)) _zmq_gps_frame_t {
+    double latitude;
+    double longitude;
+    double altitude;
+} zmq_gps_frame_t;
+
 #endif

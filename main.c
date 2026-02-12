@@ -32,6 +32,9 @@
 #ifdef HAVE_SOAPYSDR
 #include "soapysdr.h"
 #endif
+#ifdef HAVE_GPS
+#include "gps_tag.h"
+#endif
 
 #include "pfbch2.h"
 
@@ -75,6 +78,9 @@ int check_crc = 0;
 int zmq_pub_active = 0;
 char *zmq_endpoint = NULL;
 char *zmq_curve_keyfile = NULL;
+#endif
+#ifdef HAVE_GPS
+int gpsd_active = 0;
 #endif
 
 unsigned long crc_total = 0;
@@ -639,6 +645,14 @@ int main(int argc, char **argv) {
     }
 #endif
 
+#ifdef HAVE_GPS
+    if (gpsd_active) {
+        if (gps_tag_init() != 0)
+            errx(1, "Failed to connect to gpsd");
+        fprintf(stderr, "GPS: connected to gpsd\n");
+    }
+#endif
+
     if (live) {
         // TODO select first available interface
         if (bladerf_num >= 0)
@@ -739,6 +753,11 @@ int main(int argc, char **argv) {
 
     if (pcap)
         pcap_close(pcap);
+
+#ifdef HAVE_GPS
+    if (gpsd_active)
+        gps_tag_close();
+#endif
 
 #ifdef HAVE_ZMQ
     if (zmq_pub_active)

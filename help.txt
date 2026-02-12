@@ -19,6 +19,7 @@ Optional arguments:
     -I, --install           install into Wireshark extcap folder
     -Z, --zmq-pub=ENDPOINT  publish packets via ZMQ PUB (e.g. tcp://*:5555)
     -K, --zmq-curve-key=FILE  enable CURVE encryption using key file
+    -G, --gpsd              tag packets with GPS coordinates from gpsd
 
 GPU acceleration:
     When built with OpenCL support, the polyphase filterbank channelizer and
@@ -29,6 +30,17 @@ Channel count notes:
     The PFBCH2 channelizer works best with certain channel counts. Recommended
     values are 40, 48, and 60. Other counts (e.g. 44, 52, 56) may produce poor
     CRC validation rates due to characteristics of the filterbank at those sizes.
+
+GPS tagging (requires libgps):
+    When --gpsd is active, each packet is tagged with the latest GPS fix from
+    gpsd. PCAP files use PPI headers (DLT 192) with GPS coordinates. ZMQ
+    streams use multipart messages (GPS frame + PCAP record). Subscribers
+    can write GPS-tagged PCAPs using --gps flag.
+    Example:
+        ice9-bluetooth -l -i usrp-... -C 40 --gpsd -w capture.pcap
+    With ZMQ:
+        ice9-bluetooth -l ... --gpsd --zmq-pub tcp://*:5555
+        python3 tools/zmq_subscriber.py tcp://sensor:5555 -w output.pcap --gps
 
 ZMQ packet streaming (requires libzmq):
     Publishes each captured BLE packet as a PCAP record over a ZMQ PUB socket.

@@ -49,6 +49,9 @@ extern int zmq_pub_active;
 extern char *zmq_endpoint;
 extern char *zmq_curve_keyfile;
 #endif
+#ifdef HAVE_GPS
+extern int gpsd_active;
+#endif
 
 void usage(int exitcode);
 
@@ -150,6 +153,9 @@ void parse_options(int argc, char **argv) {
         { "zmq-pub", required_argument, NULL, 'Z' },
         { "zmq-curve-key", required_argument, NULL, 'K' },
 #endif
+#ifdef HAVE_GPS
+        { "gpsd", no_argument, NULL, 'G' },
+#endif
         { "install", no_argument, NULL, 'I' },
         { NULL,         0,                      NULL,           0 }
     };
@@ -157,6 +163,9 @@ void parse_options(int argc, char **argv) {
     while ((ch = getopt_long(argc, argv, "li:w:C:c:f:aIvsrh"
 #ifdef HAVE_ZMQ
                              "Z:K:"
+#endif
+#ifdef HAVE_GPS
+                             "G"
 #endif
                              , longopts, NULL)) != -1) {
         switch (ch) {
@@ -231,6 +240,12 @@ void parse_options(int argc, char **argv) {
 
             case 'K':
                 zmq_curve_keyfile = strdup(optarg);
+                break;
+#endif
+
+#ifdef HAVE_GPS
+            case 'G':
+                gpsd_active = 1;
                 break;
 #endif
 
