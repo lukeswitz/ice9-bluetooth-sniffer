@@ -74,6 +74,7 @@ int check_crc = 0;
 #ifdef HAVE_ZMQ
 int zmq_pub_active = 0;
 char *zmq_endpoint = NULL;
+char *zmq_curve_keyfile = NULL;
 #endif
 
 unsigned long crc_total = 0;
@@ -632,7 +633,7 @@ int main(int argc, char **argv) {
 
 #ifdef HAVE_ZMQ
     if (zmq_pub_active) {
-        if (zmq_pub_init(zmq_endpoint) != 0)
+        if (zmq_pub_init(zmq_endpoint, zmq_curve_keyfile) != 0)
             errx(1, "Failed to bind ZMQ PUB socket on %s", zmq_endpoint);
         fprintf(stderr, "ZMQ PUB: %s\n", zmq_endpoint);
     }
@@ -743,6 +744,7 @@ int main(int argc, char **argv) {
     if (zmq_pub_active)
         zmq_pub_close();
     free(zmq_endpoint);
+    free(zmq_curve_keyfile);
 #endif
 
     for (i = first_live; i <= last_live; ++i)

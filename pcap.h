@@ -14,7 +14,7 @@ void pcap_close(pcap_t *p);
 void pcap_write_ble(pcap_t *p, ble_packet_t *b);
 
 #ifdef HAVE_ZMQ
-int zmq_pub_init(const char *endpoint);
+int zmq_pub_init(const char *endpoint, const char *curve_keyfile);
 void zmq_pub_close(void);
 #endif
 

@@ -84,7 +84,30 @@ void pcap_close(pcap_t *p) {
 }
 
 #ifdef HAVE_ZMQ
-int zmq_pub_init(const char *endpoint) {
+static int parse_curve_keyfile(const char *path, char *public_key, char *secret_key) {
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return -1;
+    char line[256];
+    int got_pub = 0, got_sec = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '#' || line[0] == '\n')
+            continue;
+        if (strncmp(line, "public_key=", 11) == 0) {
+            strncpy(public_key, line + 11, 40);
+            public_key[40] = '\0';
+            got_pub = 1;
+        } else if (strncmp(line, "secret_key=", 11) == 0) {
+            strncpy(secret_key, line + 11, 40);
+            secret_key[40] = '\0';
+            got_sec = 1;
+        }
+    }
+    fclose(f);
+    return (got_pub && got_sec) ? 0 : -1;
+}
+
+int zmq_pub_init(const char *endpoint, const char *curve_keyfile) {
     zmq_ctx = zmq_ctx_new();
     if (!zmq_ctx)
         return -1;
@@ -96,6 +119,24 @@ int zmq_pub_init(const char *endpoint) {
     }
     int sndhwm = 1000;
     zmq_setsockopt(zmq_pub, ZMQ_SNDHWM, &sndhwm, sizeof(sndhwm));
+
+    if (curve_keyfile) {
+        char public_key[41], secret_key[41];
+        if (parse_curve_keyfile(curve_keyfile, public_key, secret_key) != 0) {
+            fprintf(stderr, "Failed to read CURVE keys from %s\n", curve_keyfile);
+            zmq_close(zmq_pub);
+            zmq_ctx_destroy(zmq_ctx);
+            zmq_pub = NULL;
+            zmq_ctx = NULL;
+            return -1;
+        }
+        int server = 1;
+        zmq_setsockopt(zmq_pub, ZMQ_CURVE_SERVER, &server, sizeof(server));
+        zmq_setsockopt(zmq_pub, ZMQ_CURVE_SECRETKEY, secret_key, 40);
+        zmq_setsockopt(zmq_pub, ZMQ_CURVE_PUBLICKEY, public_key, 40);
+        fprintf(stderr, "ZMQ CURVE: encrypted (server key: %.8s...)\n", public_key);
+    }
+
     if (zmq_bind(zmq_pub, endpoint) != 0) {
         zmq_close(zmq_pub);
         zmq_ctx_destroy(zmq_ctx);

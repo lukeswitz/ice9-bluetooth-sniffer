@@ -47,6 +47,7 @@ extern int check_crc;
 #ifdef HAVE_ZMQ
 extern int zmq_pub_active;
 extern char *zmq_endpoint;
+extern char *zmq_curve_keyfile;
 #endif
 
 void usage(int exitcode);
@@ -147,6 +148,7 @@ void parse_options(int argc, char **argv) {
         { "check-crc", no_argument, NULL, 'r' },
 #ifdef HAVE_ZMQ
         { "zmq-pub", required_argument, NULL, 'Z' },
+        { "zmq-curve-key", required_argument, NULL, 'K' },
 #endif
         { "install", no_argument, NULL, 'I' },
         { NULL,         0,                      NULL,           0 }
@@ -154,7 +156,7 @@ void parse_options(int argc, char **argv) {
 
     while ((ch = getopt_long(argc, argv, "li:w:C:c:f:aIvsrh"
 #ifdef HAVE_ZMQ
-                             "Z:"
+                             "Z:K:"
 #endif
                              , longopts, NULL)) != -1) {
         switch (ch) {
@@ -225,6 +227,10 @@ void parse_options(int argc, char **argv) {
             case 'Z':
                 zmq_endpoint = strdup(optarg);
                 zmq_pub_active = 1;
+                break;
+
+            case 'K':
+                zmq_curve_keyfile = strdup(optarg);
                 break;
 #endif
 

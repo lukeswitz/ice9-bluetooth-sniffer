@@ -18,6 +18,7 @@ Optional arguments:
     -i IFACE                which SDR to use, example: hackrf-1234abcd
     -I, --install           install into Wireshark extcap folder
     -Z, --zmq-pub=ENDPOINT  publish packets via ZMQ PUB (e.g. tcp://*:5555)
+    -K, --zmq-curve-key=FILE  enable CURVE encryption using key file
 
 GPU acceleration:
     When built with OpenCL support, the polyphase filterbank channelizer and
@@ -35,6 +36,9 @@ ZMQ packet streaming (requires libzmq):
     payload. Use for distributed sensors, remote monitoring, or custom tooling.
     Example:
         ice9-bluetooth -l -i usrp-... -C 60 --zmq-pub tcp://*:5555
+    Encrypted:
+        python3 tools/zmq_keygen.py server.key
+        ice9-bluetooth -l ... --zmq-pub tcp://*:5555 --zmq-curve-key server.key
 
 This tool also supports the Wireshark extcap interface:
     ice9-bluetooth --extcap-interfaces

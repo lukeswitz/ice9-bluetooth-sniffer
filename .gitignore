@@ -5,3 +5,5 @@ ice9-bluetooth
 help.h
 build/
 .vscode/
+*.key
+*.key.pub

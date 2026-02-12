@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright 2025-2026 CEMAXECUTER LLC
 """
 ZMQ subscriber test harness for ice9-bluetooth-sniffer.
 
@@ -17,6 +18,9 @@ Usage:
 
     # Quiet mode (only write PCAP, no terminal output):
     python3 zmq_subscriber.py tcp://localhost:5555 -w output.pcap -q
+
+    # Encrypted connection (CURVE):
+    python3 zmq_subscriber.py tcp://sensor1:5555 --server-key server.key.pub
 
 Requirements:
     pip install pyzmq
@@ -116,6 +120,20 @@ def write_pcap_header(f):
     f.flush()
 
 
+def parse_server_pubkey(path):
+    """Read server public key from a .pub key file."""
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("#") or not line:
+                continue
+            if line.startswith("server_public_key="):
+                return line.split("=", 1)[1].encode()
+            if line.startswith("public_key="):
+                return line.split("=", 1)[1].encode()
+    raise ValueError(f"No public key found in {path}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="ZMQ subscriber for ice9-bluetooth-sniffer")
@@ -127,6 +145,8 @@ def main():
                         help="Suppress terminal output")
     parser.add_argument("-t", "--timeout", type=int, default=0,
                         help="Exit after N seconds (0 = run forever)")
+    parser.add_argument("--server-key", metavar="FILE",
+                        help="Server public key file for CURVE encryption")
     args = parser.parse_args()
 
     signal.signal(signal.SIGINT, signal_handler)
@@ -136,6 +156,15 @@ def main():
     sub = ctx.socket(zmq.SUB)
     sub.setsockopt(zmq.SUBSCRIBE, b"")  # subscribe to all messages
     sub.setsockopt(zmq.RCVTIMEO, 1000)  # 1 second timeout for clean shutdown
+
+    if args.server_key:
+        server_public_key = parse_server_pubkey(args.server_key)
+        client_public, client_secret = zmq.curve_keypair()
+        sub.setsockopt(zmq.CURVE_SERVERKEY, server_public_key)
+        sub.setsockopt(zmq.CURVE_PUBLICKEY, client_public)
+        sub.setsockopt(zmq.CURVE_SECRETKEY, client_secret)
+        if not args.quiet:
+            print(f"CURVE encryption enabled", file=sys.stderr)
 
     for endpoint in args.endpoints:
         sub.connect(endpoint)

@@ -32,6 +32,10 @@ Optional SoapySDR support:
 
     sudo apt install libsoapysdr-dev
 
+Optional ZeroMQ for network packet streaming:
+
+    sudo apt install libzmq3-dev
+
 On macOS, fftw3 is not required and [Homebrew](https://brew.sh/) is the
 recommended package manager:
 
@@ -73,10 +77,12 @@ Mandatory (pick one channel mode):
 Optional:
     -w, --fifo=OUTPUT       Output pcap to file or FIFO
     -i IFACE                SDR device to use (see Supported Hardware above)
+    -r, --check-crc         Enable BLE CRC-24 validation
     -s, --stats             Print performance stats periodically
     -v, --verbose           Print detailed info about captured bursts
-    --check-crc             Enable BLE CRC-24 validation
     -I, --install           Install into Wireshark extcap folder
+    -Z, --zmq-pub=ENDPOINT  Publish packets via ZMQ PUB socket
+    -K, --zmq-curve-key=FILE  Enable CURVE encryption (requires key file)
 ```
 
 ### Examples
@@ -100,6 +106,15 @@ Capture with CRC validation and verbose output:
 Read from a previously recorded IQ file:
 
     ice9-bluetooth -f recording.fc32 -c 2441 -C 20 -w output.pcap
+
+Stream packets over ZMQ to a remote collector:
+
+    ice9-bluetooth -l -c 2441 -C 40 --zmq-pub tcp://*:5555
+
+Stream with CURVE encryption:
+
+    python3 tools/zmq_keygen.py server.key
+    ice9-bluetooth -l -c 2441 -C 40 --zmq-pub tcp://*:5555 --zmq-curve-key server.key
 
 ### Channel Count Guidelines
 
@@ -196,6 +211,41 @@ GPUs. On Linux, ensure the appropriate OpenCL ICD is installed for your GPU.
 
 Tested on NVIDIA GeForce RTX 3060 (100% realtime at 60 channels, 300%+
 AGC headroom) and Intel UHD integrated graphics (~98% realtime at 48 channels).
+
+### ZMQ Packet Streaming
+
+When built with libzmq, the `--zmq-pub` flag publishes each captured BLE
+packet over a ZMQ PUB socket. Each message is a raw PCAP record (packet
+header + BLE RF Info header + payload), the same bytes written to a PCAP
+file. This enables distributed sensor deployments, remote monitoring,
+and custom processing pipelines.
+
+A Python subscriber is included in `tools/zmq_subscriber.py`:
+
+    # Receive and display packets:
+    python3 tools/zmq_subscriber.py tcp://sensor:5555
+
+    # Write received packets to a PCAP file:
+    python3 tools/zmq_subscriber.py tcp://sensor:5555 -w output.pcap
+
+    # Subscribe to multiple sensors:
+    python3 tools/zmq_subscriber.py tcp://sensor1:5555 tcp://sensor2:5555
+
+**CURVE Encryption:** Streams can be encrypted using CurveZMQ
+(Curve25519 + ChaCha20-Poly1305). Generate a keypair, give the server
+key to the sniffer and the public key to subscribers:
+
+    python3 tools/zmq_keygen.py server.key
+    # server.key      -> sniffer (keep secret)
+    # server.key.pub  -> subscribers (distribute)
+
+    # Sniffer:
+    ice9-bluetooth -l ... --zmq-pub tcp://*:5555 --zmq-curve-key server.key
+
+    # Subscriber:
+    python3 tools/zmq_subscriber.py tcp://sensor:5555 --server-key server.key.pub
+
+Requires pyzmq built with libsodium for CURVE support (`pip install pyzmq`).
 
 ### Architecture
 
