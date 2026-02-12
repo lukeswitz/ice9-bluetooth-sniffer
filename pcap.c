@@ -4,8 +4,16 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "pcap.h"
+
+#ifdef HAVE_ZMQ
+#include <zmq.h>
+
+static void *zmq_ctx = NULL;
+static void *zmq_pub = NULL;
+#endif
 
 struct _pcap_t {
     FILE *f;
@@ -75,6 +83,55 @@ void pcap_close(pcap_t *p) {
     free(p);
 }
 
+#ifdef HAVE_ZMQ
+int zmq_pub_init(const char *endpoint) {
+    zmq_ctx = zmq_ctx_new();
+    if (!zmq_ctx)
+        return -1;
+    zmq_pub = zmq_socket(zmq_ctx, ZMQ_PUB);
+    if (!zmq_pub) {
+        zmq_ctx_destroy(zmq_ctx);
+        zmq_ctx = NULL;
+        return -1;
+    }
+    int sndhwm = 1000;
+    zmq_setsockopt(zmq_pub, ZMQ_SNDHWM, &sndhwm, sizeof(sndhwm));
+    if (zmq_bind(zmq_pub, endpoint) != 0) {
+        zmq_close(zmq_pub);
+        zmq_ctx_destroy(zmq_ctx);
+        zmq_pub = NULL;
+        zmq_ctx = NULL;
+        return -1;
+    }
+    return 0;
+}
+
+void zmq_pub_close(void) {
+    if (zmq_pub) {
+        zmq_close(zmq_pub);
+        zmq_pub = NULL;
+    }
+    if (zmq_ctx) {
+        zmq_ctx_destroy(zmq_ctx);
+        zmq_ctx = NULL;
+    }
+}
+
+static void zmq_pub_packet(pcaprec_hdr_t *ph, pcap_le_header_t *lh, uint8_t *data, unsigned len) {
+    if (!zmq_pub)
+        return;
+    unsigned msg_len = sizeof(*ph) + sizeof(*lh) + len;
+    uint8_t *buf = malloc(msg_len);
+    if (!buf)
+        return;
+    memcpy(buf, ph, sizeof(*ph));
+    memcpy(buf + sizeof(*ph), lh, sizeof(*lh));
+    memcpy(buf + sizeof(*ph) + sizeof(*lh), data, len);
+    zmq_send(zmq_pub, buf, msg_len, ZMQ_DONTWAIT);
+    free(buf);
+}
+#endif
+
 // TODO timestamp
 void pcap_write_ble(pcap_t *p, ble_packet_t *b) {
     uint16_t flags = LE_DEWHITENED | LE_SIGNAL_POWER_VALID | LE_NOISE_POWER_VALID;
@@ -99,8 +156,14 @@ void pcap_write_ble(pcap_t *p, ble_packet_t *b) {
         .incl_len = b->len + sizeof(le_header),
         .orig_len = b->len + sizeof(le_header),
     };
-    fwrite(&pcap_header, sizeof(pcap_header), 1, p->f);
-    fwrite(&le_header, sizeof(le_header), 1, p->f);
-    fwrite(b->data, b->len, 1, p->f);
-    fflush(p->f);
+    if (p) {
+        fwrite(&pcap_header, sizeof(pcap_header), 1, p->f);
+        fwrite(&le_header, sizeof(le_header), 1, p->f);
+        fwrite(b->data, b->len, 1, p->f);
+        fflush(p->f);
+    }
+
+#ifdef HAVE_ZMQ
+    zmq_pub_packet(&pcap_header, &le_header, b->data, b->len);
+#endif
 }

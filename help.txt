@@ -17,6 +17,7 @@ Optional arguments:
     -v, --verbose           print detailed info about captured bursts
     -i IFACE                which SDR to use, example: hackrf-1234abcd
     -I, --install           install into Wireshark extcap folder
+    -Z, --zmq-pub=ENDPOINT  publish packets via ZMQ PUB (e.g. tcp://*:5555)
 
 GPU acceleration:
     When built with OpenCL support, the polyphase filterbank channelizer and
@@ -27,6 +28,13 @@ Channel count notes:
     The PFBCH2 channelizer works best with certain channel counts. Recommended
     values are 40, 48, and 60. Other counts (e.g. 44, 52, 56) may produce poor
     CRC validation rates due to characteristics of the filterbank at those sizes.
+
+ZMQ packet streaming (requires libzmq):
+    Publishes each captured BLE packet as a PCAP record over a ZMQ PUB socket.
+    Subscribers receive the standard PCAP packet header + BLE RF Info header +
+    payload. Use for distributed sensors, remote monitoring, or custom tooling.
+    Example:
+        ice9-bluetooth -l -i usrp-... -C 60 --zmq-pub tcp://*:5555
 
 This tool also supports the Wireshark extcap interface:
     ice9-bluetooth --extcap-interfaces

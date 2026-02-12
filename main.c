@@ -71,6 +71,10 @@ int soapy_num = -1;
 int verbose = 0;
 int stats = 0;
 int check_crc = 0;
+#ifdef HAVE_ZMQ
+int zmq_pub_active = 0;
+char *zmq_endpoint = NULL;
+#endif
 
 unsigned long crc_total = 0;
 unsigned long crc_valid_count = 0;
@@ -626,6 +630,14 @@ int main(int argc, char **argv) {
 
     parse_options(argc, argv);
 
+#ifdef HAVE_ZMQ
+    if (zmq_pub_active) {
+        if (zmq_pub_init(zmq_endpoint) != 0)
+            errx(1, "Failed to bind ZMQ PUB socket on %s", zmq_endpoint);
+        fprintf(stderr, "ZMQ PUB: %s\n", zmq_endpoint);
+    }
+#endif
+
     if (live) {
         // TODO select first available interface
         if (bladerf_num >= 0)
@@ -726,6 +738,12 @@ int main(int argc, char **argv) {
 
     if (pcap)
         pcap_close(pcap);
+
+#ifdef HAVE_ZMQ
+    if (zmq_pub_active)
+        zmq_pub_close();
+    free(zmq_endpoint);
+#endif
 
     for (i = first_live; i <= last_live; ++i)
         burst_catcher_destroy(&catcher[i]);

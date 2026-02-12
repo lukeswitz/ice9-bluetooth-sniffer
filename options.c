@@ -44,6 +44,10 @@ extern int live;
 extern int verbose;
 extern int stats;
 extern int check_crc;
+#ifdef HAVE_ZMQ
+extern int zmq_pub_active;
+extern char *zmq_endpoint;
+#endif
 
 void usage(int exitcode);
 
@@ -141,11 +145,18 @@ void parse_options(int argc, char **argv) {
         { "verbose", no_argument, NULL, 'v' },
         { "stats", no_argument, NULL, 's' },
         { "check-crc", no_argument, NULL, 'r' },
+#ifdef HAVE_ZMQ
+        { "zmq-pub", required_argument, NULL, 'Z' },
+#endif
         { "install", no_argument, NULL, 'I' },
         { NULL,         0,                      NULL,           0 }
     };
 
-    while ((ch = getopt_long(argc, argv, "li:w:C:c:f:aIvsrh", longopts, NULL)) != -1) {
+    while ((ch = getopt_long(argc, argv, "li:w:C:c:f:aIvsrh"
+#ifdef HAVE_ZMQ
+                             "Z:"
+#endif
+                             , longopts, NULL)) != -1) {
         switch (ch) {
             case 0:
                 // long opt
@@ -209,6 +220,13 @@ void parse_options(int argc, char **argv) {
             case 'r':
                 check_crc = 1;
                 break;
+
+#ifdef HAVE_ZMQ
+            case 'Z':
+                zmq_endpoint = strdup(optarg);
+                zmq_pub_active = 1;
+                break;
+#endif
 
             case 'I':
                 do_install = 1;

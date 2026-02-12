@@ -51,6 +51,19 @@ find_package(UHD REQUIRED)
 find_package(Liquid REQUIRED)
 find_package(SoapySDR)  # Optional
 
+# Optional ZeroMQ for network packet streaming
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(ZMQ QUIET libzmq)
+endif()
+if(NOT ZMQ_FOUND)
+    find_library(ZMQ_LIBRARIES zmq)
+    find_path(ZMQ_INCLUDE_DIRS zmq.h)
+    if(ZMQ_LIBRARIES AND ZMQ_INCLUDE_DIRS)
+        set(ZMQ_FOUND TRUE)
+    endif()
+endif()
+
 # find Wireshark install dir
 execute_process(COMMAND ${CMAKE_C_COMPILER} -dumpmachine
                 OUTPUT_VARIABLE COMPILER_ABI
@@ -165,6 +178,13 @@ target_link_libraries(ice9-bluetooth
 if (SOAPYSDR_FOUND)
     target_link_libraries(ice9-bluetooth PRIVATE ${SOAPYSDR_LIBRARIES})
     target_compile_definitions(ice9-bluetooth PRIVATE HAVE_SOAPYSDR)
+endif()
+
+if (ZMQ_FOUND)
+    target_link_libraries(ice9-bluetooth PRIVATE ${ZMQ_LIBRARIES})
+    target_include_directories(ice9-bluetooth PRIVATE ${ZMQ_INCLUDE_DIRS})
+    target_compile_definitions(ice9-bluetooth PRIVATE HAVE_ZMQ)
+    message(STATUS "ZeroMQ found: enabling --zmq-pub packet streaming")
 endif()
 
 set_property(TARGET ice9-bluetooth PROPERTY C_STANDARD 99)

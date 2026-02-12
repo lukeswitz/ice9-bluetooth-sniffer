@@ -17,6 +17,9 @@ extern int verbose;
 extern unsigned long crc_total;
 extern unsigned long crc_valid_count;
 extern unsigned long crc_invalid_count;
+#ifdef HAVE_ZMQ
+extern int zmq_pub_active;
+#endif
 
 // Pre-computed 127-bit whitening sequence (7-bit maximal-length LFSR, period 127)
 // All 40 BLE channels use the same sequence at different offsets
@@ -367,7 +370,11 @@ void bluetooth_detect(uint8_t *bits, unsigned len, float *demod, unsigned demod_
                 }
             }
 
-            if (pcap)
+            if (pcap
+#ifdef HAVE_ZMQ
+                || zmq_pub_active
+#endif
+            )
                 pcap_write_ble(pcap, p);
             free(p);
         }
