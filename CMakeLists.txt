@@ -64,6 +64,18 @@ if(NOT ZMQ_FOUND)
     endif()
 endif()
 
+# Optional libgps for GPS tagging (gpsd client library)
+if(PkgConfig_FOUND)
+    pkg_check_modules(GPS QUIET libgps)
+endif()
+if(NOT GPS_FOUND)
+    find_library(GPS_LIBRARIES gps)
+    find_path(GPS_INCLUDE_DIRS gps.h)
+    if(GPS_LIBRARIES AND GPS_INCLUDE_DIRS)
+        set(GPS_FOUND TRUE)
+    endif()
+endif()
+
 # find Wireshark install dir
 execute_process(COMMAND ${CMAKE_C_COMPILER} -dumpmachine
                 OUTPUT_VARIABLE COMPILER_ABI
@@ -133,6 +145,10 @@ if (SOAPYSDR_FOUND)
     list(APPEND SOURCES ${PROJECT_SOURCE_DIR}/soapysdr.c)
 endif()
 
+if (GPS_FOUND)
+    list(APPEND SOURCES ${PROJECT_SOURCE_DIR}/gps_tag.c)
+endif()
+
 add_executable(ice9-bluetooth
     ${SOURCES}
     help.h
@@ -185,6 +201,13 @@ if (ZMQ_FOUND)
     target_include_directories(ice9-bluetooth PRIVATE ${ZMQ_INCLUDE_DIRS})
     target_compile_definitions(ice9-bluetooth PRIVATE HAVE_ZMQ)
     message(STATUS "ZeroMQ found: enabling --zmq-pub packet streaming")
+endif()
+
+if (GPS_FOUND)
+    target_link_libraries(ice9-bluetooth PRIVATE ${GPS_LIBRARIES})
+    target_include_directories(ice9-bluetooth PRIVATE ${GPS_INCLUDE_DIRS})
+    target_compile_definitions(ice9-bluetooth PRIVATE HAVE_GPS)
+    message(STATUS "libgps found: enabling --gpsd GPS tagging")
 endif()
 
 set_property(TARGET ice9-bluetooth PROPERTY C_STANDARD 99)

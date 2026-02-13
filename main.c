@@ -32,6 +32,9 @@
 #ifdef HAVE_SOAPYSDR
 #include "soapysdr.h"
 #endif
+#ifdef HAVE_GPS
+#include "gps_tag.h"
+#endif
 
 #include "pfbch2.h"
 
@@ -73,8 +76,12 @@ int stats = 0;
 int check_crc = 0;
 #ifdef HAVE_ZMQ
 int zmq_pub_active = 0;
+int zmq_connect_mode = 0;
 char *zmq_endpoint = NULL;
 char *zmq_curve_keyfile = NULL;
+#endif
+#ifdef HAVE_GPS
+int gpsd_active = 0;
 #endif
 
 unsigned long crc_total = 0;
@@ -633,9 +640,19 @@ int main(int argc, char **argv) {
 
 #ifdef HAVE_ZMQ
     if (zmq_pub_active) {
-        if (zmq_pub_init(zmq_endpoint, zmq_curve_keyfile) != 0)
-            errx(1, "Failed to bind ZMQ PUB socket on %s", zmq_endpoint);
-        fprintf(stderr, "ZMQ PUB: %s\n", zmq_endpoint);
+        if (zmq_pub_init(zmq_endpoint, zmq_curve_keyfile, zmq_connect_mode) != 0)
+            errx(1, "Failed to %s ZMQ PUB socket on %s",
+                 zmq_connect_mode ? "connect" : "bind", zmq_endpoint);
+        fprintf(stderr, "ZMQ PUB: %s (%s)\n", zmq_endpoint,
+                zmq_connect_mode ? "connect" : "bind");
+    }
+#endif
+
+#ifdef HAVE_GPS
+    if (gpsd_active) {
+        if (gps_tag_init() != 0)
+            errx(1, "Failed to connect to gpsd");
+        fprintf(stderr, "GPS: connected to gpsd\n");
     }
 #endif
 
@@ -739,6 +756,11 @@ int main(int argc, char **argv) {
 
     if (pcap)
         pcap_close(pcap);
+
+#ifdef HAVE_GPS
+    if (gpsd_active)
+        gps_tag_close();
+#endif
 
 #ifdef HAVE_ZMQ
     if (zmq_pub_active)
