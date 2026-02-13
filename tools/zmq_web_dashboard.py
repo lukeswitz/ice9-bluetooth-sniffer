@@ -116,6 +116,158 @@ def extract_mac(ble_data, aa):
     return ":".join(f"{b:02x}" for b in reversed(mac_bytes))
 
 
+# ---------------------------------------------------------------------------
+# BLE device fingerprinting
+# ---------------------------------------------------------------------------
+BLE_COMPANY_IDS = {
+    0x004C: "Apple",
+    0x0006: "Microsoft",
+    0x00E0: "Google",
+    0x0075: "Samsung",
+    0x000F: "Broadcom",
+    0x0059: "Nordic",
+    0x000A: "Qualcomm",
+    0x0002: "Intel",
+    0x0131: "Huawei",
+    0x038F: "Xiaomi",
+    0x0087: "Garmin",
+    0x0157: "Anhui Huami (Amazfit)",
+    0x00D2: "Bose",
+    0x012D: "Sony",
+    0x000D: "Texas Instruments",
+    0x0310: "Tile",
+    0x004F: "Meta (Oculus)",
+    0x0171: "Amazon",
+    0x01DA: "Fitbit",
+    0x0822: "Shenzhen Goodix",
+}
+
+APPLE_CONTINUITY_TYPES = {
+    0x01: "Setup",
+    0x02: "iBeacon",
+    0x05: "AirDrop",
+    0x07: "AirPods",
+    0x09: "AirPlay",
+    0x0C: "Handoff",
+    0x0D: "Hotspot",
+    0x0E: "Hotspot Src",
+    0x0F: "Nearby Action",
+    0x10: "Nearby Info",
+    0x12: "Find My",
+}
+
+AD_TYPE_FLAGS            = 0x01
+AD_TYPE_UUID16_INCOMPLETE = 0x02
+AD_TYPE_UUID16_COMPLETE  = 0x03
+AD_TYPE_NAME_SHORT       = 0x08
+AD_TYPE_NAME_COMPLETE    = 0x09
+AD_TYPE_TX_POWER         = 0x0A
+AD_TYPE_APPEARANCE       = 0x19
+AD_TYPE_MANUFACTURER     = 0xFF
+
+BLE_APPEARANCE = {
+    0x0000: "Unknown",
+    0x0040: "Phone",
+    0x0080: "Computer",
+    0x00C0: "Watch",
+    0x00C1: "Sports Watch",
+    0x0100: "Clock",
+    0x0140: "Display",
+    0x0180: "Remote",
+    0x01C0: "Eyeglasses",
+    0x0200: "Tag",
+    0x0240: "Keyring",
+    0x0300: "Pulse Oximeter",
+    0x03C0: "Heart Rate Sensor",
+    0x0440: "Blood Pressure",
+    0x04C0: "HID",
+    0x04C1: "Keyboard",
+    0x04C2: "Mouse",
+    0x04C3: "Joystick",
+    0x04C4: "Gamepad",
+    0x0540: "Barcode Scanner",
+    0x0580: "Thermometer",
+    0x0940: "Hearing Aid",
+    0x0CC0: "Sensor",
+    0x0CC1: "Motion Sensor",
+}
+
+
+def classify_mac_type(ble_data):
+    """Classify MAC address type from PDU header TxAdd bit."""
+    if len(ble_data) < 6:
+        return "unknown"
+    # TxAdd is bit 6 of the first header byte (ble_data[4])
+    tx_add = (ble_data[4] >> 6) & 1
+    if tx_add == 0:
+        return "public"
+    # Random address: check the two MSBs of the address (ble_data[11])
+    if len(ble_data) < 12:
+        return "random"
+    msb = ble_data[11]
+    top2 = (msb >> 6) & 0x03
+    if top2 == 0x03:
+        return "static"       # static random -- persists per boot
+    elif top2 == 0x01:
+        return "resolvable"   # resolvable private -- rotates, can be resolved with IRK
+    elif top2 == 0x00:
+        return "non-resolv"   # non-resolvable private -- fully anonymous
+    return "random"
+
+
+def parse_ad_structures(adv_data):
+    """Parse AD structures from BLE advertising data payload."""
+    result = {
+        "name": None,
+        "manufacturer": None,
+        "company_id": None,
+        "tx_power": None,
+        "appearance": None,
+        "apple_type": None,
+        "mfr_data": None,
+    }
+    i = 0
+    while i < len(adv_data):
+        if i + 1 >= len(adv_data):
+            break
+        length = adv_data[i]
+        if length == 0 or i + length >= len(adv_data):
+            break
+        ad_type = adv_data[i + 1]
+        ad_data = adv_data[i + 2 : i + 1 + length]
+
+        if ad_type in (AD_TYPE_NAME_COMPLETE, AD_TYPE_NAME_SHORT):
+            try:
+                result["name"] = ad_data.decode("utf-8", errors="replace")
+            except Exception:
+                pass
+
+        elif ad_type == AD_TYPE_TX_POWER and len(ad_data) >= 1:
+            result["tx_power"] = struct.unpack("b", ad_data[:1])[0]
+
+        elif ad_type == AD_TYPE_APPEARANCE and len(ad_data) >= 2:
+            code = struct.unpack("<H", ad_data[:2])[0]
+            # Match by category (top bits) or exact
+            result["appearance"] = BLE_APPEARANCE.get(
+                code, BLE_APPEARANCE.get(code & 0xFFC0, f"0x{code:04x}"))
+
+        elif ad_type == AD_TYPE_MANUFACTURER and len(ad_data) >= 2:
+            cid = struct.unpack("<H", ad_data[:2])[0]
+            result["company_id"] = cid
+            result["manufacturer"] = BLE_COMPANY_IDS.get(cid, f"0x{cid:04x}")
+            result["mfr_data"] = ad_data[2:]
+
+            # Apple Continuity protocol parsing
+            if cid == 0x004C and len(ad_data) >= 3:
+                apple_msg_type = ad_data[2]
+                result["apple_type"] = APPLE_CONTINUITY_TYPES.get(
+                    apple_msg_type, f"0x{apple_msg_type:02x}")
+
+        i += 1 + length
+
+    return result
+
+
 def parse_ble_packet(data):
     """Parse a ZMQ message containing a PCAP record."""
     if len(data) < PCAP_REC_HDR.size + BLE_RF_HDR.size:
@@ -139,6 +291,8 @@ def parse_ble_packet(data):
     # Extract PDU type for advertising packets
     pdu_type = None
     pdu_type_name = None
+    mac_type = None
+    fingerprint = {}
     if is_adv and len(ble_data) >= 6:
         pdu_type = ble_data[4] & 0x0F
         pdu_names = {
@@ -147,6 +301,16 @@ def parse_ble_packet(data):
             6: "ADV_SCAN_IND",
         }
         pdu_type_name = pdu_names.get(pdu_type, f"ADV_{pdu_type}")
+        mac_type = classify_mac_type(ble_data)
+
+        # Parse AD structures from advertising data (after AA + Header + AdvA)
+        if len(ble_data) > 12:
+            pdu_len = ble_data[5]
+            adv_data_start = 12  # AA(4) + Header(2) + AdvA(6)
+            adv_data_end = min(6 + pdu_len, len(ble_data))
+            if adv_data_end > adv_data_start:
+                fingerprint = parse_ad_structures(
+                    ble_data[adv_data_start:adv_data_end])
 
     return {
         "timestamp": ts_sec + ts_usec / 1e6,
@@ -161,7 +325,9 @@ def parse_ble_packet(data):
         "is_adv": is_adv,
         "pdu_type": pdu_type_name or ("ADV" if is_adv else "DATA"),
         "mac": mac,
+        "mac_type": mac_type,
         "data_len": len(ble_data),
+        "fingerprint": fingerprint,
     }
 
 
@@ -201,6 +367,8 @@ class DashboardState:
                 return
 
             now = round(pkt["timestamp"], 6)
+            fp = pkt.get("fingerprint", {})
+
             if mac in self.devices:
                 d = self.devices[mac]
                 d["pkts"] += 1
@@ -216,6 +384,17 @@ class DashboardState:
                 if gps_info:
                     d["lat"] = round(gps_info[0], 6)
                     d["lon"] = round(gps_info[1], 6)
+                # Update fingerprint fields (keep best info seen)
+                if fp.get("name") and not d.get("name"):
+                    d["name"] = fp["name"]
+                if fp.get("manufacturer") and not d.get("mfr"):
+                    d["mfr"] = fp["manufacturer"]
+                if fp.get("apple_type") and not d.get("apple"):
+                    d["apple"] = fp["apple_type"]
+                if fp.get("appearance") and not d.get("appear"):
+                    d["appear"] = fp["appearance"]
+                if fp.get("tx_power") is not None and d.get("tx_pwr") is None:
+                    d["tx_pwr"] = fp["tx_power"]
             else:
                 d = {
                     "mac": mac,
@@ -227,6 +406,12 @@ class DashboardState:
                     "pkts": 1,
                     "crc_ok": 1 if pkt["crc_valid"] else 0,
                     "crc_bad": 1 if pkt["crc_valid"] is False else 0,
+                    "mac_type": pkt.get("mac_type", ""),
+                    "name": fp.get("name") or "",
+                    "mfr": fp.get("manufacturer") or "",
+                    "apple": fp.get("apple_type") or "",
+                    "appear": fp.get("appearance") or "",
+                    "tx_pwr": fp.get("tx_power"),
                 }
                 if gps_info:
                     d["lat"] = round(gps_info[0], 6)
@@ -510,9 +695,11 @@ tr.fresh td { background: #1a2a1a; }
       <thead><tr>
         <th data-col="last" class="sorted">last seen</th>
         <th data-col="mac">mac</th>
+        <th data-col="mac_type">addr</th>
+        <th data-col="mfr">manufacturer</th>
+        <th data-col="name">name</th>
         <th data-col="type">type</th>
         <th data-col="rssi">rssi</th>
-        <th data-col="freq">freq</th>
         <th data-col="pkts" class="count">pkts</th>
         <th data-col="crc">crc %</th>
         <th data-col="first">first seen</th>
@@ -593,12 +780,26 @@ function sortDevices(devs) {
   });
 }
 
+function addrCls(t) {
+  if (t==='public') return 'red';
+  if (t==='static') return 'org';
+  if (t==='resolvable') return 'yel';
+  return 'dim';
+}
+
+function mfrLabel(d) {
+  /* Build a descriptive manufacturer/device string */
+  let s = d.mfr || '';
+  if (d.apple) s = s ? s+' '+d.apple : d.apple;
+  if (d.appear && d.appear !== 'Unknown') s = s ? s+' ('+d.appear+')' : d.appear;
+  return s;
+}
+
 function renderDevices() {
   const now = Date.now() / 1000;
   const sorted = sortDevices(devices);
   document.getElementById('empty').style.display = sorted.length ? 'none' : 'block';
 
-  /* Rebuild table body */
   const frag = document.createDocumentFragment();
   for (const d of sorted) {
     const tr = document.createElement('tr');
@@ -609,12 +810,15 @@ function renderDevices() {
     const crcPct = total > 0 ? Math.round(100*d.crc_ok/total)+'%' : '-';
     const crcCls = total > 0 ? (d.crc_ok/total > 0.8 ? 'grn' : d.crc_ok/total > 0.4 ? 'yel' : 'red') : 'dim';
     const isAdv = d.type !== 'DATA';
+    const mt = d.mac_type || '';
     tr.innerHTML =
       `<td class="dim">${ago(d.last)}</td>`+
       `<td class="${priv?'masked':''}">${mc}</td>`+
+      `<td class="${addrCls(mt)}">${mt}</td>`+
+      `<td>${mfrLabel(d)}</td>`+
+      `<td class="blu">${d.name||''}</td>`+
       `<td class="${isAdv?'blu':'org'}">${d.type}</td>`+
       `<td>${d.rssi}</td>`+
-      `<td>${d.freq}</td>`+
       `<td class="count">${d.pkts.toLocaleString()}</td>`+
       `<td class="${crcCls}">${crcPct}</td>`+
       `<td class="dim">${fmtT(d.first)}</td>`;
