@@ -38,7 +38,7 @@ import struct
 import sys
 import threading
 import time
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 try:
@@ -166,7 +166,7 @@ def parse_ble_packet(data):
 
 
 # ---------------------------------------------------------------------------
-# Shared dashboard state
+# Shared dashboard state (device-centric, Kismet-style)
 # ---------------------------------------------------------------------------
 class DashboardState:
     def __init__(self):
@@ -174,29 +174,16 @@ class DashboardState:
         self.total_packets = 0
         self.crc_valid = 0
         self.crc_invalid = 0
-        self.unique_macs = set()
+        self.data_packets = 0
         self.gps_count = 0
         self.last_gps = None
         self.start_time = time.time()
         self.sse_queues = []
-        self.recent_packets = []
-        self.max_recent = 200
+        # Device table: mac -> device info dict
+        self.devices = {}
+        self._dirty = True
 
     def add_packet(self, pkt, gps_info=None):
-        entry = {
-            "ts": round(pkt["timestamp"], 6),
-            "freq": pkt["freq_mhz"],
-            "rssi": pkt["signal_power"],
-            "type": pkt["pdu_type"],
-            "mac": pkt["mac"] or "",
-            "aa": f"{pkt['aa']:08x}",
-            "len": pkt["data_len"],
-            "crc": "ok" if pkt["crc_valid"] else ("bad" if pkt["crc_valid"] is False else ""),
-        }
-        if gps_info:
-            entry["lat"] = round(gps_info[0], 6)
-            entry["lon"] = round(gps_info[1], 6)
-
         with self.lock:
             self.total_packets += 1
             if pkt["crc_checked"]:
@@ -204,21 +191,48 @@ class DashboardState:
                     self.crc_valid += 1
                 else:
                     self.crc_invalid += 1
-            if pkt["mac"]:
-                self.unique_macs.add(pkt["mac"])
             if gps_info:
                 self.gps_count += 1
                 self.last_gps = gps_info
 
-            self.recent_packets.append(entry)
-            if len(self.recent_packets) > self.max_recent:
-                self.recent_packets = self.recent_packets[-self.max_recent:]
+            mac = pkt["mac"]
+            if not mac:
+                self.data_packets += 1
+                return
 
-            for q in self.sse_queues:
-                try:
-                    q.put_nowait(entry)
-                except queue.Full:
-                    pass
+            now = round(pkt["timestamp"], 6)
+            if mac in self.devices:
+                d = self.devices[mac]
+                d["pkts"] += 1
+                d["last"] = now
+                d["freq"] = pkt["freq_mhz"]
+                if pkt["signal_power"] > d["rssi"]:
+                    d["rssi"] = pkt["signal_power"]
+                d["type"] = pkt["pdu_type"]
+                if pkt["crc_valid"]:
+                    d["crc_ok"] += 1
+                elif pkt["crc_valid"] is False:
+                    d["crc_bad"] += 1
+                if gps_info:
+                    d["lat"] = round(gps_info[0], 6)
+                    d["lon"] = round(gps_info[1], 6)
+            else:
+                d = {
+                    "mac": mac,
+                    "first": now,
+                    "last": now,
+                    "freq": pkt["freq_mhz"],
+                    "rssi": pkt["signal_power"],
+                    "type": pkt["pdu_type"],
+                    "pkts": 1,
+                    "crc_ok": 1 if pkt["crc_valid"] else 0,
+                    "crc_bad": 1 if pkt["crc_valid"] is False else 0,
+                }
+                if gps_info:
+                    d["lat"] = round(gps_info[0], 6)
+                    d["lon"] = round(gps_info[1], 6)
+                self.devices[mac] = d
+            self._dirty = True
 
     def get_stats(self):
         with self.lock:
@@ -230,18 +244,26 @@ class DashboardState:
                 "crc_pct": round(100.0 * self.crc_valid / crc_total, 1) if crc_total > 0 else None,
                 "crc_valid": self.crc_valid,
                 "crc_invalid": self.crc_invalid,
-                "macs": len(self.unique_macs),
+                "macs": len(self.devices),
+                "data_pkts": self.data_packets,
                 "gps_count": self.gps_count,
                 "last_gps": list(self.last_gps[:2]) if self.last_gps else None,
                 "uptime": round(elapsed, 1),
             }
 
-    def get_recent(self):
+    def get_devices(self):
+        """Return device list sorted by last-seen (most recent first)."""
         with self.lock:
-            return list(self.recent_packets)
+            self._dirty = False
+            devs = sorted(self.devices.values(), key=lambda d: d["last"], reverse=True)
+            return devs
+
+    def is_dirty(self):
+        with self.lock:
+            return self._dirty
 
     def register_sse(self):
-        q = queue.Queue(maxsize=200)
+        q = queue.Queue(maxsize=50)
         with self.lock:
             self.sse_queues.append(q)
         return q
@@ -268,8 +290,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._serve_sse()
         elif path == "/api/stats":
             self._serve_json(state.get_stats())
-        elif path == "/api/recent":
-            self._serve_json(state.get_recent())
+        elif path == "/api/devices":
+            self._serve_json(state.get_devices())
         else:
             self.send_error(404)
 
@@ -298,13 +320,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
         q = state.register_sse()
         try:
             while running:
-                try:
-                    pkt = q.get(timeout=2.0)
-                    self.wfile.write(f"data: {json.dumps(pkt)}\n\n".encode())
-                    self.wfile.flush()
-                except queue.Empty:
-                    self.wfile.write(b": heartbeat\n\n")
-                    self.wfile.flush()
+                time.sleep(1.0)
+                # Push full device list + stats once per second
+                devs = state.get_devices()
+                stats = state.get_stats()
+                payload = json.dumps({"stats": stats, "devices": devs})
+                self.wfile.write(f"event: update\ndata: {payload}\n\n".encode())
+                self.wfile.flush()
         except (BrokenPipeError, ConnectionError, OSError):
             pass
         finally:
@@ -408,7 +430,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font: 12px/1.4 monospace; background: #1a1a1a; color: #ccc; }
-a { color: #ccc; }
 
 .toolbar { padding: 4px 8px; background: #252525; border-bottom: 1px solid #333;
            display: flex; align-items: center; gap: 12px; font-size: 11px; }
@@ -429,7 +450,7 @@ button.on { background: #653; border-color: #a75; color: #fa8; }
 .tab:hover:not(.active) { color: #aaa; }
 
 .stats { padding: 3px 8px; background: #202020; border-bottom: 1px solid #333;
-         font-size: 11px; color: #888; }
+         font-size: 11px; color: #888; display: flex; flex-wrap: wrap; gap: 0; }
 .stats span { margin-right: 16px; }
 .stats .val { color: #ccc; }
 
@@ -439,21 +460,27 @@ button.on { background: #653; border-color: #a75; color: #fa8; }
 .table-area { flex: 1; overflow: auto; }
 
 table { width: 100%; border-collapse: collapse; }
-thead { position: sticky; top: 0; }
-th { background: #252525; border-bottom: 1px solid #444; padding: 3px 8px;
-     text-align: left; color: #888; font-weight: normal; }
-td { padding: 2px 8px; border-bottom: 1px solid #2a2a2a; white-space: nowrap; }
+thead { position: sticky; top: 0; z-index: 2; }
+th { background: #252525; border-bottom: 1px solid #444; padding: 4px 8px;
+     text-align: left; color: #888; font-weight: normal; cursor: pointer; }
+th:hover { color: #ccc; }
+th.sorted::after { content: ' \25bc'; }
+th.sorted.asc::after { content: ' \25b2'; }
+td { padding: 3px 8px; border-bottom: 1px solid #2a2a2a; white-space: nowrap; }
 tr:hover td { background: #222; }
+tr.fresh td { background: #1a2a1a; }
 
 .dim { color: #666; }
 .grn { color: #7c4; }
 .red { color: #c44; }
 .blu { color: #68f; }
 .org { color: #ca6; }
+.yel { color: #ec5; }
 .masked { color: #666; }
 
 #map { flex: 1; width: 100%; }
 .empty { padding: 40px; text-align: center; color: #555; }
+.count { text-align: right; }
 </style>
 </head>
 <body>
@@ -462,7 +489,7 @@ tr:hover td { background: #222; }
   <b>ice9-bluetooth</b>
   <span class="status" id="conn">disconnected</span>
   <div class="tabs" id="tabBar">
-    <div class="tab active" data-tab="packets" onclick="switchTab('packets')">packets</div>
+    <div class="tab active" data-tab="devices" onclick="switchTab('devices')">devices</div>
   </div>
   <span class="spacer"></span>
   <button id="privBtn" class="on" onclick="togglePrivacy()">MAC hidden</button>
@@ -472,20 +499,27 @@ tr:hover td { background: #222; }
   <span>pkts: <span class="val" id="sTotal">0</span></span>
   <span>rate: <span class="val" id="sRate">0</span>/s</span>
   <span>crc: <span class="val" id="sCrc">--</span></span>
-  <span>macs: <span class="val" id="sMacs">0</span></span>
+  <span>devices: <span class="val" id="sMacs">0</span></span>
+  <span>data: <span class="val" id="sData">0</span></span>
   <span>up: <span class="val" id="sUp">0s</span></span>
 </div>
 
-<div class="panel active" id="panelPackets">
+<div class="panel active" id="panelDevices">
   <div class="table-area" id="tWrap">
     <table>
       <thead><tr>
-        <th>time</th><th>freq</th><th>rssi</th><th>type</th>
-        <th>mac</th><th>aa</th><th>len</th><th>crc</th>
+        <th data-col="last" class="sorted">last seen</th>
+        <th data-col="mac">mac</th>
+        <th data-col="type">type</th>
+        <th data-col="rssi">rssi</th>
+        <th data-col="freq">freq</th>
+        <th data-col="pkts" class="count">pkts</th>
+        <th data-col="crc">crc %</th>
+        <th data-col="first">first seen</th>
       </tr></thead>
       <tbody id="tb"></tbody>
     </table>
-    <div class="empty" id="empty">waiting for packets...</div>
+    <div class="empty" id="empty">waiting for devices...</div>
   </div>
 </div>
 
@@ -494,9 +528,11 @@ tr:hover td { background: #222; }
 </div>
 
 <script>
-let priv = true, map = null, marker = null, trail = [], curTab = 'packets';
-const MAX = 300, GPS = __GPS_ENABLED__;
-const tb = document.getElementById('tb'), tw = document.getElementById('tWrap');
+let priv = true, map = null, marker = null, trail = [], curTab = 'devices';
+let sortCol = 'last', sortAsc = false;
+const GPS = __GPS_ENABLED__;
+const tb = document.getElementById('tb');
+let devices = [];
 
 function switchTab(name) {
   curTab = name;
@@ -511,16 +547,10 @@ function togglePrivacy() {
   const b = document.getElementById('privBtn');
   b.textContent = priv ? 'MAC hidden' : 'MAC visible';
   b.classList.toggle('on', priv);
-  document.querySelectorAll('.mc').forEach(td => {
-    td.textContent = priv ? mask(td.dataset.m) : td.dataset.m;
-    td.className = 'mc' + (priv && td.dataset.m ? ' masked' : '');
-  });
+  renderDevices();
 }
 
-function mask(m) {
-  if (!m) return '';
-  return 'xx:xx:xx:xx:xx:xx';
-}
+function mask(m) { return m ? 'xx:xx:xx:xx:xx:xx' : ''; }
 
 function fmtT(ts) {
   const d = new Date(ts * 1000);
@@ -533,61 +563,96 @@ function fmtUp(s) {
   return Math.floor(s/3600)+'h'+Math.floor((s%3600)/60)+'m';
 }
 
-function addRow(p) {
-  document.getElementById('empty').style.display = 'none';
-  const tr = document.createElement('tr');
-  const isAdv = p.type !== 'DATA';
-  const mc = priv ? mask(p.mac) : p.mac;
-  const cc = p.crc==='ok'?'grn':p.crc==='bad'?'red':'dim';
-  const ct = p.crc==='ok'?'ok':p.crc==='bad'?'bad':'-';
-
-  tr.innerHTML =
-    `<td>${fmtT(p.ts)}</td>`+
-    `<td>${p.freq}</td>`+
-    `<td>${p.rssi}</td>`+
-    `<td class="${isAdv?'blu':'org'}">${p.type}</td>`+
-    `<td class="mc${priv&&p.mac?' masked':''}" data-m="${p.mac||''}">${mc||''}</td>`+
-    `<td class="dim">${p.aa}</td>`+
-    `<td>${p.len}</td>`+
-    `<td class="${cc}">${ct}</td>`;
-  tb.appendChild(tr);
-  while (tb.children.length > MAX) tb.removeChild(tb.firstChild);
-  if (tw.scrollHeight - tw.scrollTop - tw.clientHeight < 60) tw.scrollTop = tw.scrollHeight;
+function ago(ts) {
+  const s = (Date.now()/1000) - ts;
+  if (s < 2) return 'now';
+  if (s < 60) return Math.round(s)+'s ago';
+  if (s < 3600) return Math.floor(s/60)+'m ago';
+  return Math.floor(s/3600)+'h ago';
 }
 
-function updStats() {
-  fetch('/api/stats').then(r=>r.json()).then(s=>{
-    document.getElementById('sTotal').textContent = s.total.toLocaleString();
-    document.getElementById('sRate').textContent = s.rate;
-    document.getElementById('sCrc').textContent = s.crc_pct!==null ? s.crc_pct+'%' : '--';
-    document.getElementById('sMacs').textContent = s.macs;
-    document.getElementById('sUp').textContent = fmtUp(s.uptime);
-    if (GPS && s.last_gps && map) {
-      const ll = s.last_gps;
-      if (!marker) {
-        marker = L.circleMarker(ll,{radius:6,color:'#68f',fillColor:'#68f',fillOpacity:0.8,weight:1}).addTo(map);
-        map.setView(ll,15);
-      } else {
-        marker.setLatLng(ll);
-      }
-      trail.push(ll);
-      if (trail.length>500) trail=trail.slice(-500);
-      if (window._t) map.removeLayer(window._t);
-      if (trail.length>1) window._t=L.polyline(trail,{color:'#68f',weight:2,opacity:0.5}).addTo(map);
+/* Column sorting */
+document.querySelectorAll('th[data-col]').forEach(th => {
+  th.addEventListener('click', () => {
+    const col = th.dataset.col;
+    if (sortCol === col) { sortAsc = !sortAsc; }
+    else { sortCol = col; sortAsc = false; }
+    document.querySelectorAll('th').forEach(h => { h.classList.remove('sorted','asc'); });
+    th.classList.add('sorted');
+    if (sortAsc) th.classList.add('asc');
+    renderDevices();
+  });
+});
+
+function sortDevices(devs) {
+  const dir = sortAsc ? 1 : -1;
+  return devs.slice().sort((a, b) => {
+    let va = a[sortCol], vb = b[sortCol];
+    if (typeof va === 'string') return dir * va.localeCompare(vb);
+    return dir * ((va||0) - (vb||0));
+  });
+}
+
+function renderDevices() {
+  const now = Date.now() / 1000;
+  const sorted = sortDevices(devices);
+  document.getElementById('empty').style.display = sorted.length ? 'none' : 'block';
+
+  /* Rebuild table body */
+  const frag = document.createDocumentFragment();
+  for (const d of sorted) {
+    const tr = document.createElement('tr');
+    const fresh = (now - d.last) < 3;
+    if (fresh) tr.className = 'fresh';
+    const mc = priv ? mask(d.mac) : d.mac;
+    const total = d.crc_ok + d.crc_bad;
+    const crcPct = total > 0 ? Math.round(100*d.crc_ok/total)+'%' : '-';
+    const crcCls = total > 0 ? (d.crc_ok/total > 0.8 ? 'grn' : d.crc_ok/total > 0.4 ? 'yel' : 'red') : 'dim';
+    const isAdv = d.type !== 'DATA';
+    tr.innerHTML =
+      `<td class="dim">${ago(d.last)}</td>`+
+      `<td class="${priv?'masked':''}">${mc}</td>`+
+      `<td class="${isAdv?'blu':'org'}">${d.type}</td>`+
+      `<td>${d.rssi}</td>`+
+      `<td>${d.freq}</td>`+
+      `<td class="count">${d.pkts.toLocaleString()}</td>`+
+      `<td class="${crcCls}">${crcPct}</td>`+
+      `<td class="dim">${fmtT(d.first)}</td>`;
+    frag.appendChild(tr);
+  }
+  tb.innerHTML = '';
+  tb.appendChild(frag);
+}
+
+function updStats(s) {
+  document.getElementById('sTotal').textContent = s.total.toLocaleString();
+  document.getElementById('sRate').textContent = s.rate;
+  document.getElementById('sCrc').textContent = s.crc_pct!==null ? s.crc_pct+'%' : '--';
+  document.getElementById('sMacs').textContent = s.macs;
+  document.getElementById('sData').textContent = s.data_pkts.toLocaleString();
+  document.getElementById('sUp').textContent = fmtUp(s.uptime);
+  if (GPS && s.last_gps && map) {
+    const ll = s.last_gps;
+    if (!marker) {
+      marker = L.circleMarker(ll,{radius:6,color:'#68f',fillColor:'#68f',fillOpacity:0.8,weight:1}).addTo(map);
+      map.setView(ll,15);
+    } else {
+      marker.setLatLng(ll);
     }
-  }).catch(()=>{});
+    trail.push(ll);
+    if (trail.length>500) trail=trail.slice(-500);
+    if (window._t) map.removeLayer(window._t);
+    if (trail.length>1) window._t=L.polyline(trail,{color:'#68f',weight:2,opacity:0.5}).addTo(map);
+  }
 }
 
 if (GPS) {
-  // Add map tab
   const tab = document.createElement('div');
   tab.className = 'tab';
   tab.dataset.tab = 'map';
   tab.textContent = 'map';
   tab.onclick = function(){ switchTab('map'); };
   document.getElementById('tabBar').appendChild(tab);
-
-  // Load Leaflet
   const lk=document.createElement('link'); lk.rel='stylesheet';
   lk.href='https://unpkg.com/leaflet@1.9.4/dist/leaflet.css'; document.head.appendChild(lk);
   const sc=document.createElement('script');
@@ -601,10 +666,13 @@ if (GPS) {
 const es = new EventSource('/events');
 const cn = document.getElementById('conn');
 es.onopen = ()=>{ cn.textContent='connected'; cn.className='status ok'; };
-es.onmessage = e => addRow(JSON.parse(e.data));
 es.onerror = ()=>{ cn.textContent='disconnected'; cn.className='status'; };
-setInterval(updStats, 1000);
-updStats();
+es.addEventListener('update', e => {
+  const d = JSON.parse(e.data);
+  devices = d.devices;
+  updStats(d.stats);
+  renderDevices();
+});
 </script>
 </body>
 </html>"""
@@ -659,7 +727,7 @@ def main():
     zmq_thread.start()
 
     # Start HTTP server
-    httpd = HTTPServer(("0.0.0.0", args.port), DashboardHandler)
+    httpd = ThreadingHTTPServer(("0.0.0.0", args.port), DashboardHandler)
     httpd.timeout = 1
 
     print(f"\n  ICE9 Bluetooth Sniffer - Web Dashboard", file=sys.stderr)

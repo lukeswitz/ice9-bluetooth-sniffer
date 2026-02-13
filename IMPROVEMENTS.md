@@ -190,6 +190,24 @@ PFBCH2 filterbank, not a bug in the GPU implementation:
 
 Recommended channel counts: 40, 48, or 60 (with capable GPU).
 
+**Heavy RF Environment Test (NVIDIA RTX 3060, 60 channels):**
+
+| Metric | Value |
+|--------|-------|
+| Duration | ~5 minutes |
+| Channels | 60 |
+| Total packets | 29,296 |
+| CRC valid | 15,227 (52.0%) |
+| CRC invalid | 14,069 |
+| Channelizer | 60.0 Msamp/sec (100% realtime) |
+| AGC headroom | ~280-315 Msamp/sec (245-270% realtime) |
+| Overflows | 0 |
+
+In a congested RF environment the CRC valid rate drops from ~82% to ~52%
+due to collisions and multipath, but the channelizer maintains 100%
+realtime with zero drops. The GPU has substantial headroom even under
+heavy load.
+
 ## Files Modified
 
 - **bluetooth.c**: CRC-24 algorithm, CRC validation logic, AA correlator
