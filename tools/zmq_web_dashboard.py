@@ -3,9 +3,10 @@
 """
 Live web dashboard for ice9-bluetooth-sniffer ZMQ streams.
 
-Connects to one or more ZMQ PUB endpoints and displays captured BLE packets
-in a real-time web interface. Features a privacy toggle to mask MAC addresses
-(useful for video recording / streaming).
+Connects to one or more ZMQ PUB endpoints and presents a Kismet-style device
+list with BLE device fingerprinting, CRC-gated tracking, and aggregate
+summaries. Features a privacy toggle to mask MAC addresses (useful for video
+recording / streaming).
 
 Usage:
     # Basic - connect to local sensor:
@@ -26,12 +27,16 @@ Usage:
     # Also write PCAP while viewing dashboard:
     python3 zmq_web_dashboard.py tcp://localhost:5555 -w capture.pcap --gps
 
+    # Update Bluetooth device database (Nordic Semiconductor, MIT licensed):
+    python3 zmq_web_dashboard.py tcp://localhost:5555 --update-bt-db
+
 Requirements:
     pip install pyzmq
 """
 
 import argparse
 import json
+import os
 import queue
 import signal
 import struct
@@ -39,7 +44,10 @@ import sys
 import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import urlparse
+from urllib.request import urlopen
+from urllib.error import URLError
 
 try:
     import zmq
@@ -120,25 +128,27 @@ def extract_mac(ble_data, aa):
 # BLE device fingerprinting
 # ---------------------------------------------------------------------------
 BLE_COMPANY_IDS = {
-    0x004C: "Apple",
-    0x0006: "Microsoft",
-    0x00E0: "Google",
-    0x0075: "Samsung",
-    0x000F: "Broadcom",
-    0x0059: "Nordic",
-    0x000A: "Qualcomm",
+    0x0001: "Nokia",
     0x0002: "Intel",
-    0x0131: "Huawei",
-    0x038F: "Xiaomi",
-    0x0087: "Garmin",
-    0x0157: "Anhui Huami (Amazfit)",
-    0x00D2: "Bose",
-    0x012D: "Sony",
+    0x0006: "Microsoft",
+    0x000A: "Qualcomm",
     0x000D: "Texas Instruments",
-    0x0310: "Tile",
+    0x000F: "Broadcom",
+    0x004C: "Apple",
     0x004F: "Meta (Oculus)",
+    0x0059: "Nordic",
+    0x0075: "Samsung",
+    0x0087: "Garmin",
+    0x009E: "Bose",
+    0x00D2: "Bose",
+    0x00E0: "Google",
+    0x012D: "Sony",
+    0x0131: "Huawei",
+    0x0157: "Anhui Huami (Amazfit)",
     0x0171: "Amazon",
     0x01DA: "Fitbit",
+    0x0310: "Tile",
+    0x038F: "Xiaomi",
     0x0822: "Shenzhen Goodix",
 }
 
@@ -162,6 +172,7 @@ AD_TYPE_UUID16_COMPLETE  = 0x03
 AD_TYPE_NAME_SHORT       = 0x08
 AD_TYPE_NAME_COMPLETE    = 0x09
 AD_TYPE_TX_POWER         = 0x0A
+AD_TYPE_SVC_DATA_16      = 0x16  # Service Data - 16-bit UUID (very common)
 AD_TYPE_APPEARANCE       = 0x19
 AD_TYPE_MANUFACTURER     = 0xFF
 
@@ -191,6 +202,187 @@ BLE_APPEARANCE = {
     0x0CC0: "Sensor",
     0x0CC1: "Motion Sensor",
 }
+
+BLE_UUID16_SERVICES = {
+    # Standard GATT services
+    0x1800: "Generic Access",
+    0x1801: "Generic Attribute",
+    0x1802: "Immediate Alert",
+    0x1803: "Link Loss",
+    0x1804: "Tx Power",
+    0x1805: "Current Time",
+    0x1806: "Ref Time Update",
+    0x1807: "Next DST Change",
+    0x1808: "Glucose",
+    0x1809: "Health Thermo",
+    0x180A: "Device Info",
+    0x180D: "Heart Rate",
+    0x180E: "Phone Alert",
+    0x180F: "Battery",
+    0x1810: "Blood Pressure",
+    0x1811: "Alert Notify",
+    0x1812: "HID",
+    0x1813: "Scan Params",
+    0x1814: "Running Speed",
+    0x1816: "Cycling Speed",
+    0x1818: "Cycling Power",
+    0x1819: "Location Nav",
+    0x181A: "Environmental",
+    0x181B: "Body Composition",
+    0x181C: "User Data",
+    0x181D: "Weight Scale",
+    0x181E: "Bond Mgmt",
+    0x1820: "IP Support",
+    0x1821: "Indoor Positioning",
+    0x1822: "Pulse Oximeter",
+    0x1824: "Transport Discovery",
+    0x1825: "Object Transfer",
+    0x1826: "Fitness Machine",
+    0x1827: "Mesh Provisioning",
+    0x1828: "Mesh Proxy",
+    0x1829: "Reconnect Config",
+    0x183A: "Audio Input",
+    0x183B: "Volume Control",
+    0x183C: "Volume Offset",
+    0x183E: "Coord Set ID",
+    0x184D: "Microphone",
+    0x184E: "Audio Stream",
+    0x1853: "Common Audio",
+    0x1854: "Hearing Access",
+    0x1855: "Telephony",
+    0x1856: "Media Control",
+    0x1857: "Generic Media",
+    0x1858: "Constant Tone",
+    0x1859: "Object ID",
+    # Member company 16-bit UUIDs (0xFCxx, 0xFDxx, 0xFExx range)
+    0xFCB2: "Apple",
+    0xFD62: "Fitbit",
+    0xFD6F: "Exposure Notify",
+    0xFD69: "Samsung",
+    0xFD82: "Loop (Disney)",
+    0xFDA6: "OPPO",
+    0xFDB5: "OnePlus",
+    0xFDCF: "Nreal",
+    0xFDDF: "Harman (JBL)",
+    0xFDF0: "Google Nearby",
+    0xFE03: "Amazon",
+    0xFE07: "Sonos",
+    0xFE0D: "Xiaomi",
+    0xFE0F: "Philips",
+    0xFE13: "Apple ANCS",
+    0xFE26: "Google",
+    0xFE2C: "Google Fast Pair",
+    0xFE43: "Andreas Stihl",
+    0xFE50: "Google",
+    0xFE59: "Nordic DFU",
+    0xFE6E: "JBL",
+    0xFE78: "Garmin",
+    0xFE8A: "Apple MFi",
+    0xFE95: "Xiaomi Mi",
+    0xFE9F: "Google",
+    0xFEA0: "Google",
+    0xFEAA: "Eddystone",
+    0xFEAD: "Tile",
+    0xFEB2: "Microsoft",
+    0xFEB8: "Facebook",
+    0xFEBB: "Adafruit",
+    0xFEBE: "Bose",
+    0xFEC7: "Apple Notification",
+    0xFEC8: "Apple MIDI",
+    0xFEC9: "Apple ANCS",
+    0xFED4: "Apple",
+    0xFED8: "Google Thread",
+    0xFEDF: "Design SHIFT",
+    0xFEE7: "Tencent",
+    0xFEED: "Tile",
+    0xFEF3: "Google",
+    0xFEF5: "Dialog Semi",
+}
+
+AD_TYPE_UUID16_LIST = {0x02, 0x03}  # 16-bit UUID lists only (0x04-05 = 32-bit, 0x06-07 = 128-bit)
+
+# ---------------------------------------------------------------------------
+# Auto-updatable Bluetooth numbers database
+# ---------------------------------------------------------------------------
+NORDIC_DB_BASE = "https://raw.githubusercontent.com/NordicSemiconductor/bluetooth-numbers-database/master/v1"
+NORDIC_COMPANY_IDS_URL = f"{NORDIC_DB_BASE}/company_ids.json"
+NORDIC_SERVICE_UUIDS_URL = f"{NORDIC_DB_BASE}/service_uuids.json"
+
+# Cache directory: ~/.cache/ice9-bt-sniffer/
+BT_DB_CACHE_DIR = Path.home() / ".cache" / "ice9-bt-sniffer"
+
+
+def bt_db_update(quiet=False):
+    """Download latest Bluetooth numbers from Nordic Semiconductor database."""
+    BT_DB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    files = [
+        (NORDIC_COMPANY_IDS_URL, BT_DB_CACHE_DIR / "company_ids.json"),
+        (NORDIC_SERVICE_UUIDS_URL, BT_DB_CACHE_DIR / "service_uuids.json"),
+    ]
+
+    for url, path in files:
+        try:
+            if not quiet:
+                print(f"  Downloading {url} ...", file=sys.stderr)
+            with urlopen(url, timeout=15) as resp:
+                data = resp.read()
+            # Validate JSON before writing
+            json.loads(data)
+            path.write_bytes(data)
+            if not quiet:
+                print(f"  Saved to {path}", file=sys.stderr)
+        except (URLError, OSError, json.JSONDecodeError) as e:
+            print(f"  WARNING: Failed to download {url}: {e}", file=sys.stderr)
+            return False
+
+    if not quiet:
+        print(f"  Bluetooth numbers database updated.", file=sys.stderr)
+    return True
+
+
+def bt_db_load():
+    """Load cached Nordic database and merge over hardcoded dicts.
+
+    Hardcoded entries take priority (they include curated short names),
+    but any codes NOT in the hardcoded dicts get filled in from the
+    Nordic database.
+    """
+    # Company IDs
+    cid_path = BT_DB_CACHE_DIR / "company_ids.json"
+    if cid_path.exists():
+        try:
+            entries = json.loads(cid_path.read_text())
+            added = 0
+            for entry in entries:
+                code = entry.get("code")
+                name = entry.get("name", "")
+                if code is not None and code not in BLE_COMPANY_IDS and name:
+                    BLE_COMPANY_IDS[code] = name
+                    added += 1
+            print(f"  BT DB: loaded {added} additional company IDs from cache", file=sys.stderr)
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"  WARNING: Failed to load {cid_path}: {e}", file=sys.stderr)
+
+    # Service UUIDs
+    svc_path = BT_DB_CACHE_DIR / "service_uuids.json"
+    if svc_path.exists():
+        try:
+            entries = json.loads(svc_path.read_text())
+            added = 0
+            for entry in entries:
+                uuid_str = entry.get("uuid", "")
+                name = entry.get("name", "")
+                try:
+                    uuid_int = int(uuid_str, 16)
+                except (ValueError, TypeError):
+                    continue
+                if uuid_int not in BLE_UUID16_SERVICES and name:
+                    BLE_UUID16_SERVICES[uuid_int] = name
+                    added += 1
+            print(f"  BT DB: loaded {added} additional service UUIDs from cache", file=sys.stderr)
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"  WARNING: Failed to load {svc_path}: {e}", file=sys.stderr)
 
 
 def classify_mac_type(ble_data):
@@ -225,6 +417,7 @@ def parse_ad_structures(adv_data):
         "appearance": None,
         "apple_type": None,
         "mfr_data": None,
+        "services": [],
     }
     i = 0
     while i < len(adv_data):
@@ -250,6 +443,21 @@ def parse_ad_structures(adv_data):
             # Match by category (top bits) or exact
             result["appearance"] = BLE_APPEARANCE.get(
                 code, BLE_APPEARANCE.get(code & 0xFFC0, f"0x{code:04x}"))
+
+        elif ad_type in AD_TYPE_UUID16_LIST and len(ad_data) >= 2:
+            # Parse 16-bit service UUIDs (complete or incomplete lists)
+            for j in range(0, len(ad_data) - 1, 2):
+                uuid16 = struct.unpack("<H", ad_data[j:j+2])[0]
+                svc = BLE_UUID16_SERVICES.get(uuid16, f"0x{uuid16:04x}")
+                if svc not in result["services"]:
+                    result["services"].append(svc)
+
+        elif ad_type == AD_TYPE_SVC_DATA_16 and len(ad_data) >= 2:
+            # Service Data: first 2 bytes are the 16-bit UUID, rest is data
+            uuid16 = struct.unpack("<H", ad_data[:2])[0]
+            svc = BLE_UUID16_SERVICES.get(uuid16, f"0x{uuid16:04x}")
+            if svc not in result["services"]:
+                result["services"].append(svc)
 
         elif ad_type == AD_TYPE_MANUFACTURER and len(ad_data) >= 2:
             cid = struct.unpack("<H", ad_data[:2])[0]
@@ -298,13 +506,20 @@ def parse_ble_packet(data):
         pdu_names = {
             0: "ADV_IND", 1: "ADV_DIRECT", 2: "ADV_NONCONN",
             3: "SCAN_REQ", 4: "SCAN_RSP", 5: "CONNECT_IND",
-            6: "ADV_SCAN_IND",
+            6: "ADV_SCAN_IND", 7: "ADV_EXT",
         }
         pdu_type_name = pdu_names.get(pdu_type, f"ADV_{pdu_type}")
         mac_type = classify_mac_type(ble_data)
 
-        # Parse AD structures from advertising data (after AA + Header + AdvA)
-        if len(ble_data) > 12:
+        # Only PDU types 0 (ADV_IND), 2 (ADV_NONCONN), 4 (SCAN_RSP),
+        # 6 (ADV_SCAN_IND) carry AD structures.
+        # Types 1 (ADV_DIRECT), 3 (SCAN_REQ), 5 (CONNECT_IND) do NOT --
+        # their payload is MAC addresses / connection params, not AD data.
+        # Only parse CRC-valid packets to avoid false fingerprints from
+        # bit errors (corrupted bytes decode as garbage AD structures).
+        ad_pdu_types = {0, 2, 4, 6}
+        crc_ok = (crc_valid is True) or (not crc_checked)
+        if crc_ok and pdu_type in ad_pdu_types and len(ble_data) > 12:
             pdu_len = ble_data[5]
             adv_data_start = 12  # AA(4) + Header(2) + AdvA(6)
             adv_data_end = min(6 + pdu_len, len(ble_data))
@@ -347,6 +562,8 @@ class DashboardState:
         self.sse_queues = []
         # Device table: mac -> device info dict
         self.devices = {}
+        # Channel activity: rf_channel -> packet count
+        self.channel_counts = {}
         self._dirty = True
 
     def add_packet(self, pkt, gps_info=None):
@@ -361,22 +578,41 @@ class DashboardState:
                 self.gps_count += 1
                 self.last_gps = gps_info
 
+            # Track channel activity
+            rf_ch = pkt.get("rf_channel")
+            if rf_ch is not None:
+                self.channel_counts[rf_ch] = self.channel_counts.get(rf_ch, 0) + 1
+
             mac = pkt["mac"]
             if not mac:
                 self.data_packets += 1
                 return
 
+            # Only create/update device entries for CRC-valid packets.
+            # CRC-failed packets have bit errors that corrupt MAC addresses,
+            # PDU types, and AD data -- creating phantom device entries.
+            # When CRC checking is off, allow all packets (backward compat).
+            crc_ok = (pkt["crc_valid"] is True) or (not pkt["crc_checked"])
+            if not crc_ok:
+                return
+
             now = round(pkt["timestamp"], 6)
             fp = pkt.get("fingerprint", {})
+            rssi = pkt["signal_power"]
 
             if mac in self.devices:
                 d = self.devices[mac]
                 d["pkts"] += 1
                 d["last"] = now
                 d["freq"] = pkt["freq_mhz"]
-                if pkt["signal_power"] > d["rssi"]:
-                    d["rssi"] = pkt["signal_power"]
                 d["type"] = pkt["pdu_type"]
+                # RSSI tracking: best, min, sum, count
+                if rssi > d["rssi"]:
+                    d["rssi"] = rssi
+                if rssi < d["rssi_min"]:
+                    d["rssi_min"] = rssi
+                d["rssi_sum"] += rssi
+                d["rssi_cnt"] += 1
                 if pkt["crc_valid"]:
                     d["crc_ok"] += 1
                 elif pkt["crc_valid"] is False:
@@ -395,13 +631,19 @@ class DashboardState:
                     d["appear"] = fp["appearance"]
                 if fp.get("tx_power") is not None and d.get("tx_pwr") is None:
                     d["tx_pwr"] = fp["tx_power"]
+                for svc in fp.get("services") or []:
+                    if svc not in d["services"]:
+                        d["services"].append(svc)
             else:
                 d = {
                     "mac": mac,
                     "first": now,
                     "last": now,
                     "freq": pkt["freq_mhz"],
-                    "rssi": pkt["signal_power"],
+                    "rssi": rssi,
+                    "rssi_min": rssi,
+                    "rssi_sum": rssi,
+                    "rssi_cnt": 1,
                     "type": pkt["pdu_type"],
                     "pkts": 1,
                     "crc_ok": 1 if pkt["crc_valid"] else 0,
@@ -412,6 +654,7 @@ class DashboardState:
                     "apple": fp.get("apple_type") or "",
                     "appear": fp.get("appearance") or "",
                     "tx_pwr": fp.get("tx_power"),
+                    "services": list(fp.get("services") or []),
                 }
                 if gps_info:
                     d["lat"] = round(gps_info[0], 6)
@@ -440,8 +683,82 @@ class DashboardState:
         """Return device list sorted by last-seen (most recent first)."""
         with self.lock:
             self._dirty = False
-            devs = sorted(self.devices.values(), key=lambda d: d["last"], reverse=True)
+            devs = []
+            for d in self.devices.values():
+                # Add computed avg RSSI for the JSON output
+                dd = dict(d)
+                dd["rssi_avg"] = round(d["rssi_sum"] / d["rssi_cnt"]) if d["rssi_cnt"] else d["rssi"]
+                # Don't send internal accumulators
+                del dd["rssi_sum"]
+                del dd["rssi_cnt"]
+                devs.append(dd)
+            devs.sort(key=lambda x: x["last"], reverse=True)
             return devs
+
+    def get_summary(self):
+        """Return aggregate breakdowns for the summary tab."""
+        with self.lock:
+            by_mfr = {}
+            by_mac_type = {}
+            by_pdu = {}
+            by_svc = {}
+            svc_device_count = 0
+            top_talkers = []
+            for d in self.devices.values():
+                # Manufacturer
+                m = d["mfr"] or "Unknown"
+                by_mfr[m] = by_mfr.get(m, 0) + 1
+                # MAC type
+                mt = d["mac_type"] or "unknown"
+                by_mac_type[mt] = by_mac_type.get(mt, 0) + 1
+                # PDU type
+                pt = d["type"]
+                by_pdu[pt] = by_pdu.get(pt, 0) + 1
+                # Services (count unique devices per service)
+                svcs = d.get("services", [])
+                if svcs:
+                    svc_device_count += 1
+                for svc in svcs:
+                    by_svc[svc] = by_svc.get(svc, 0) + 1
+                # Top talkers
+                top_talkers.append((d["mac"], d["pkts"], d["mfr"], d["name"]))
+
+            top_talkers.sort(key=lambda x: x[1], reverse=True)
+            top10 = [{"mac": t[0], "pkts": t[1], "mfr": t[2], "name": t[3]}
+                     for t in top_talkers[:15]]
+
+            # Sort breakdowns by count descending
+            def sorted_dict(d):
+                return sorted(d.items(), key=lambda x: x[1], reverse=True)
+
+            # Channel distribution: convert rf_channel to BLE channel number
+            ch_dist = {}
+            for rf_ch, cnt in self.channel_counts.items():
+                freq = 2402 + rf_ch * 2
+                if freq == 2402:
+                    ble_ch = 37
+                elif freq == 2426:
+                    ble_ch = 38
+                elif freq == 2480:
+                    ble_ch = 39
+                elif 2404 <= freq <= 2424:
+                    ble_ch = (freq - 2404) // 2
+                elif 2428 <= freq <= 2478:
+                    ble_ch = (freq - 2428) // 2 + 11
+                else:
+                    ble_ch = rf_ch
+                ch_dist[ble_ch] = ch_dist.get(ble_ch, 0) + cnt
+
+            return {
+                "by_mfr": sorted_dict(by_mfr),
+                "by_mac_type": sorted_dict(by_mac_type),
+                "by_pdu": sorted_dict(by_pdu),
+                "by_svc": sorted_dict(by_svc),
+                "svc_devices": svc_device_count,
+                "total_devices": len(self.devices),
+                "top_talkers": top10,
+                "channels": sorted(ch_dist.items()),
+            }
 
     def is_dirty(self):
         with self.lock:
@@ -477,6 +794,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._serve_json(state.get_stats())
         elif path == "/api/devices":
             self._serve_json(state.get_devices())
+        elif path == "/api/summary":
+            self._serve_json(state.get_summary())
+        elif path == "/api/export.csv":
+            self._serve_csv()
+        elif path == "/api/export.json":
+            self._serve_export_json()
         else:
             self.send_error(404)
 
@@ -494,6 +817,40 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
 
+    def _serve_csv(self):
+        devs = state.get_devices()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/csv")
+        self.send_header("Content-Disposition", "attachment; filename=ble_devices.csv")
+        self.end_headers()
+        cols = ["mac", "mac_type", "mfr", "apple", "name", "appear", "services",
+                "type", "rssi", "rssi_min", "rssi_avg", "tx_pwr", "pkts",
+                "crc_ok", "crc_bad", "freq", "first", "last"]
+        self.wfile.write((",".join(cols) + "\n").encode())
+        for d in devs:
+            row = []
+            for c in cols:
+                v = d.get(c, "")
+                if c == "services":
+                    v = "|".join(d.get("services", []))
+                elif v is None:
+                    v = ""
+                row.append(str(v).replace(",", ";"))
+            self.wfile.write((",".join(row) + "\n").encode())
+
+    def _serve_export_json(self):
+        data = {
+            "stats": state.get_stats(),
+            "summary": state.get_summary(),
+            "devices": state.get_devices(),
+        }
+        payload = json.dumps(data, indent=2).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Disposition", "attachment; filename=ble_capture.json")
+        self.end_headers()
+        self.wfile.write(payload)
+
     def _serve_sse(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -506,10 +863,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
         try:
             while running:
                 time.sleep(1.0)
-                # Push full device list + stats once per second
+                # Push full device list + stats + summary once per second
                 devs = state.get_devices()
                 stats = state.get_stats()
-                payload = json.dumps({"stats": stats, "devices": devs})
+                summary = state.get_summary()
+                payload = json.dumps({"stats": stats, "devices": devs, "summary": summary})
                 self.wfile.write(f"event: update\ndata: {payload}\n\n".encode())
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionError, OSError):
@@ -666,6 +1024,36 @@ tr.fresh td { background: #1a2a1a; }
 #map { flex: 1; width: 100%; }
 .empty { padding: 40px; text-align: center; color: #555; }
 .count { text-align: right; }
+
+/* Summary panel */
+.summary-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px;
+                padding: 12px; overflow: auto; flex: 1; }
+.summary-card { background: #202020; border: 1px solid #333; padding: 8px; }
+.summary-card h3 { color: #888; font-size: 11px; font-weight: normal;
+                   text-transform: uppercase; margin-bottom: 6px; border-bottom: 1px solid #333;
+                   padding-bottom: 4px; }
+.summary-card.wide { grid-column: span 2; }
+.summary-card.full { grid-column: span 3; }
+.bar-row { display: flex; align-items: center; margin: 2px 0; font-size: 11px; }
+.bar-label { width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bar-track { flex: 1; height: 12px; background: #2a2a2a; margin: 0 6px; position: relative; }
+.bar-fill { height: 100%; position: absolute; left: 0; top: 0; }
+.bar-val { width: 50px; text-align: right; color: #888; }
+.talker-row { display: flex; font-size: 11px; margin: 1px 0; padding: 2px 0;
+              border-bottom: 1px solid #2a2a2a; }
+.talker-row .rank { width: 20px; color: #555; }
+.talker-row .mac { width: 140px; }
+.talker-row .info { flex: 1; color: #888; overflow: hidden; text-overflow: ellipsis; }
+.talker-row .cnt { width: 60px; text-align: right; }
+.ch-grid { display: flex; flex-wrap: wrap; gap: 2px; }
+.ch-cell { width: 28px; height: 22px; display: flex; align-items: center; justify-content: center;
+           font-size: 9px; border: 1px solid #333; }
+.export-bar { padding: 4px 8px; background: #202020; border-top: 1px solid #333;
+              display: flex; gap: 8px; align-items: center; font-size: 11px; }
+@media (max-width: 900px) {
+  .summary-grid { grid-template-columns: 1fr; }
+  .summary-card.wide, .summary-card.full { grid-column: span 1; }
+}
 </style>
 </head>
 <body>
@@ -675,8 +1063,11 @@ tr.fresh td { background: #1a2a1a; }
   <span class="status" id="conn">disconnected</span>
   <div class="tabs" id="tabBar">
     <div class="tab active" data-tab="devices" onclick="switchTab('devices')">devices</div>
+    <div class="tab" data-tab="summary" onclick="switchTab('summary')">summary</div>
   </div>
   <span class="spacer"></span>
+  <button onclick="location.href='/api/export.csv'">export CSV</button>
+  <button onclick="location.href='/api/export.json'">export JSON</button>
   <button id="privBtn" class="on" onclick="togglePrivacy()">MAC hidden</button>
 </div>
 
@@ -698,6 +1089,7 @@ tr.fresh td { background: #1a2a1a; }
         <th data-col="mac_type">addr</th>
         <th data-col="mfr">manufacturer</th>
         <th data-col="name">name</th>
+        <th data-col="services">services</th>
         <th data-col="type">type</th>
         <th data-col="rssi">rssi</th>
         <th data-col="pkts" class="count">pkts</th>
@@ -710,6 +1102,17 @@ tr.fresh td { background: #1a2a1a; }
   </div>
 </div>
 
+<div class="panel" id="panelSummary">
+  <div class="summary-grid" id="summaryGrid">
+    <div class="summary-card" id="cardMfr"><h3>by manufacturer</h3></div>
+    <div class="summary-card" id="cardAddr"><h3>by address type</h3></div>
+    <div class="summary-card" id="cardPdu"><h3>by PDU type</h3></div>
+    <div class="summary-card" id="cardSvc"><h3>services seen (devices)</h3></div>
+    <div class="summary-card wide" id="cardTop"><h3>top talkers (by packets)</h3></div>
+    <div class="summary-card full" id="cardCh"><h3>channel activity</h3></div>
+  </div>
+</div>
+
 <div class="panel" id="panelMap">
   <div id="map"></div>
 </div>
@@ -719,7 +1122,7 @@ let priv = true, map = null, marker = null, trail = [], curTab = 'devices';
 let sortCol = 'last', sortAsc = false;
 const GPS = __GPS_ENABLED__;
 const tb = document.getElementById('tb');
-let devices = [];
+let devices = [], summary = null;
 
 function switchTab(name) {
   curTab = name;
@@ -727,6 +1130,7 @@ function switchTab(name) {
   document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
   document.getElementById('panel'+name.charAt(0).toUpperCase()+name.slice(1)).classList.add('active');
   if (name === 'map' && map) map.invalidateSize();
+  if (name === 'summary' && summary) renderSummary(summary);
 }
 
 function togglePrivacy() {
@@ -735,6 +1139,7 @@ function togglePrivacy() {
   b.textContent = priv ? 'MAC hidden' : 'MAC visible';
   b.classList.toggle('on', priv);
   renderDevices();
+  if (summary) renderSummary(summary);
 }
 
 function mask(m) { return m ? 'xx:xx:xx:xx:xx:xx' : ''; }
@@ -775,6 +1180,7 @@ function sortDevices(devs) {
   const dir = sortAsc ? 1 : -1;
   return devs.slice().sort((a, b) => {
     let va = a[sortCol], vb = b[sortCol];
+    if (sortCol === 'services') { va = (a.services||[]).join(','); vb = (b.services||[]).join(','); }
     if (typeof va === 'string') return dir * va.localeCompare(vb);
     return dir * ((va||0) - (vb||0));
   });
@@ -788,11 +1194,22 @@ function addrCls(t) {
 }
 
 function mfrLabel(d) {
-  /* Build a descriptive manufacturer/device string */
   let s = d.mfr || '';
   if (d.apple) s = s ? s+' '+d.apple : d.apple;
   if (d.appear && d.appear !== 'Unknown') s = s ? s+' ('+d.appear+')' : d.appear;
   return s;
+}
+
+function rssiLabel(d) {
+  if (d.rssi === d.rssi_min) return d.rssi;
+  return d.rssi_min + '/' + d.rssi_avg + '/' + d.rssi;
+}
+
+function svcLabel(d) {
+  const s = d.services || [];
+  if (!s.length) return '';
+  if (s.length <= 2) return s.join(', ');
+  return s.slice(0,2).join(', ') + ' +' + (s.length-2);
 }
 
 function renderDevices() {
@@ -817,8 +1234,9 @@ function renderDevices() {
       `<td class="${addrCls(mt)}">${mt}</td>`+
       `<td>${mfrLabel(d)}</td>`+
       `<td class="blu">${d.name||''}</td>`+
+      `<td class="dim">${svcLabel(d)}</td>`+
       `<td class="${isAdv?'blu':'org'}">${d.type}</td>`+
-      `<td>${d.rssi}</td>`+
+      `<td>${rssiLabel(d)}</td>`+
       `<td class="count">${d.pkts.toLocaleString()}</td>`+
       `<td class="${crcCls}">${crcPct}</td>`+
       `<td class="dim">${fmtT(d.first)}</td>`;
@@ -826,6 +1244,82 @@ function renderDevices() {
   }
   tb.innerHTML = '';
   tb.appendChild(frag);
+}
+
+/* Summary tab rendering */
+const barColors = {
+  mfr: '#68f', addr: '#ca6', pdu: '#7c4', svc: '#c6f'
+};
+
+function renderBarChart(containerId, data, color, maxItems) {
+  const el = document.getElementById(containerId);
+  const h3 = el.querySelector('h3').outerHTML;
+  if (!data || !data.length) { el.innerHTML = h3 + '<div class="dim" style="padding:8px">no data</div>'; return; }
+  const max = data[0][1];
+  const items = data.slice(0, maxItems || 12);
+  let html = h3;
+  for (const [label, count] of items) {
+    const pct = max > 0 ? Math.round(100 * count / max) : 0;
+    html += `<div class="bar-row"><span class="bar-label">${label}</span>`+
+      `<span class="bar-track"><span class="bar-fill" style="width:${pct}%;background:${color};opacity:0.6"></span></span>`+
+      `<span class="bar-val">${count.toLocaleString()}</span></div>`;
+  }
+  if (data.length > items.length) {
+    html += `<div class="bar-row dim" style="justify-content:center">+${data.length-items.length} more</div>`;
+  }
+  el.innerHTML = html;
+}
+
+function renderTopTalkers(data) {
+  const el = document.getElementById('cardTop');
+  const h3 = el.querySelector('h3').outerHTML;
+  if (!data || !data.length) { el.innerHTML = h3 + '<div class="dim" style="padding:8px">no data</div>'; return; }
+  let html = h3;
+  data.forEach((t, i) => {
+    const mc = priv ? mask(t.mac) : t.mac;
+    const info = [t.mfr, t.name].filter(Boolean).join(' - ') || '';
+    html += `<div class="talker-row"><span class="rank">${i+1}</span>`+
+      `<span class="mac ${priv?'masked':''}">${mc}</span>`+
+      `<span class="info">${info}</span>`+
+      `<span class="cnt">${t.pkts.toLocaleString()}</span></div>`;
+  });
+  el.innerHTML = html;
+}
+
+function renderChannels(data) {
+  const el = document.getElementById('cardCh');
+  const h3 = el.querySelector('h3').outerHTML;
+  if (!data || !data.length) { el.innerHTML = h3 + '<div class="dim" style="padding:8px">no data</div>'; return; }
+  const max = Math.max(...data.map(d => d[1]));
+  let html = h3 + '<div class="ch-grid">';
+  for (const [ch, cnt] of data) {
+    const intensity = max > 0 ? cnt / max : 0;
+    const r = Math.round(40 + intensity * 80);
+    const g = Math.round(40 + intensity * 140);
+    const b = Math.round(40 + intensity * 60);
+    const isAdv = ch >= 37;
+    const border = isAdv ? 'border-color:#ca6' : '';
+    html += `<div class="ch-cell" style="background:rgb(${r},${g},${b});${border}" `+
+      `title="Ch ${ch}: ${cnt.toLocaleString()} pkts">${ch}</div>`;
+  }
+  html += '</div>';
+  el.innerHTML = html;
+}
+
+function renderSummary(s) {
+  renderBarChart('cardMfr', s.by_mfr, barColors.mfr, 12);
+  renderBarChart('cardAddr', s.by_mac_type, barColors.addr, 8);
+  renderBarChart('cardPdu', s.by_pdu, barColors.pdu, 8);
+  renderBarChart('cardSvc', s.by_svc, barColors.svc, 12);
+  /* Add context line showing how many devices have services at all */
+  const svcEl = document.getElementById('cardSvc');
+  if (s.total_devices > 0) {
+    let ctx = svcEl.querySelector('.svc-ctx');
+    if (!ctx) { ctx = document.createElement('div'); ctx.className = 'svc-ctx dim'; ctx.style.cssText = 'font-size:10px;padding:4px 0 0;border-top:1px solid #333;margin-top:4px'; svcEl.appendChild(ctx); }
+    ctx.textContent = s.svc_devices + ' of ' + s.total_devices + ' devices advertise GATT services (most use mfr-specific data)';
+  }
+  renderTopTalkers(s.top_talkers);
+  renderChannels(s.channels);
 }
 
 function updStats(s) {
@@ -874,8 +1368,10 @@ es.onerror = ()=>{ cn.textContent='disconnected'; cn.className='status'; };
 es.addEventListener('update', e => {
   const d = JSON.parse(e.data);
   devices = d.devices;
+  summary = d.summary;
   updStats(d.stats);
   renderDevices();
+  if (curTab === 'summary') renderSummary(summary);
 });
 </script>
 </body>
@@ -902,7 +1398,17 @@ def main():
                         help="Server public key file for CURVE encryption")
     parser.add_argument("--bind", action="store_true",
                         help="Bind SUB socket (sensors connect to us) instead of connecting")
+    parser.add_argument("--update-bt-db", action="store_true",
+                        help="Download/update Bluetooth numbers database from Nordic Semiconductor, then run")
     args = parser.parse_args()
+
+    # Update Bluetooth numbers database if requested
+    if args.update_bt_db:
+        print("\n  Updating Bluetooth numbers database...", file=sys.stderr)
+        bt_db_update()
+
+    # Load cached Bluetooth numbers (merges over hardcoded fallbacks)
+    bt_db_load()
 
     gps_enabled = args.gps
 

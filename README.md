@@ -247,6 +247,98 @@ key to the sniffer and the public key to subscribers:
 
 Requires pyzmq built with libsodium for CURVE support (`pip install pyzmq`).
 
+### Web Dashboard
+
+A real-time web dashboard is included in `tools/zmq_web_dashboard.py`. It
+subscribes to one or more ZMQ PUB endpoints and presents a Kismet-style
+device list with live updating, BLE device fingerprinting, and aggregate
+summaries.
+
+**Quick start:**
+
+    # Start the sniffer with ZMQ streaming and CRC validation:
+    ice9-bluetooth -l -c 2441 -C 40 --zmq-pub tcp://*:5555 --check-crc -s
+
+    # In another terminal, start the dashboard:
+    pip install pyzmq   # only dependency
+    python3 tools/zmq_web_dashboard.py tcp://localhost:5555
+
+    # Open http://localhost:8099 in a browser
+
+**Features:**
+
+- **Live device table** with MAC, manufacturer, device name, RSSI, PDU type,
+  packet count, and first/last seen timestamps
+- **BLE device fingerprinting**: parses advertising data (AD structures) to
+  extract manufacturer (from company IDs), device names, appearance, TX power,
+  and 16-bit service UUIDs (both UUID lists and Service Data)
+- **CRC-gated device tracking**: when `--check-crc` is enabled on the sniffer,
+  only CRC-valid packets create device entries -- eliminates phantom devices
+  from corrupted packets. Backward compatible when CRC checking is off.
+- **Summary tab**: breakdowns by manufacturer, MAC address type, PDU type,
+  and GATT services; top talkers list; channel activity heatmap
+- **Privacy mode**: MAC addresses masked by default (toggle in UI)
+- **PCAP recording**: `--write` flag to simultaneously save to a PCAP file
+- **GPS mapping**: `--gps` flag enables GPS column and live map display
+  (requires gpsd running, GPS coordinates embedded in PPI-wrapped PCAPs)
+- **CURVE encryption**: `--server-key` flag for encrypted ZMQ connections
+- **Multi-sensor**: accepts multiple ZMQ endpoints for distributed deployments
+
+**Dashboard options:**
+
+```
+python3 tools/zmq_web_dashboard.py [endpoints...] [options]
+
+  -p, --port PORT           HTTP port (default: 8099)
+  -w, --write FILE          Also write packets to PCAP file
+  --gps                     Enable GPS column and map display
+  --server-key FILE         Server public key for CURVE encryption
+  --bind                    Bind SUB socket instead of connecting
+  --update-bt-db            Download/refresh Bluetooth numbers database
+```
+
+**Examples:**
+
+    # Dashboard with GPS and PCAP recording:
+    python3 tools/zmq_web_dashboard.py tcp://sensor:5555 --gps -w capture.pcap
+
+    # Multiple sensors with encryption:
+    python3 tools/zmq_web_dashboard.py tcp://sensor1:5555 tcp://sensor2:5555 \
+        --server-key server.key.pub
+
+    # Update Bluetooth device database (downloads latest from Nordic Semiconductor):
+    python3 tools/zmq_web_dashboard.py tcp://localhost:5555 --update-bt-db
+
+**Bluetooth Numbers Database:**
+
+The dashboard includes hardcoded lookup tables for common BLE manufacturer
+company IDs and 16-bit service UUIDs (Apple, Samsung, Google, Bose, Tile,
+Fitbit, etc.). For broader coverage, use `--update-bt-db` to download the
+community-maintained [Nordic Semiconductor Bluetooth numbers database](https://github.com/NordicSemiconductor/bluetooth-numbers-database)
+(MIT licensed). This caches ~4000 company IDs and ~125 service UUIDs to
+`~/.cache/ice9-bt-sniffer/`. Cached data is loaded automatically on
+subsequent runs; hardcoded entries take priority for curated short names.
+
+### GPS Tagging
+
+When built with libgps (`sudo apt install libgps-dev`) and a gpsd instance
+is running, the sniffer can tag each captured packet with the current GPS
+position. GPS coordinates are embedded in the PCAP using the PPI (Per-Packet
+Information) header format, compatible with Wireshark and Kismet.
+
+    # Start gpsd (example with USB GPS):
+    sudo gpsd /dev/ttyUSB0 -F /var/run/gpsd.sock
+
+    # Capture with GPS tagging:
+    ice9-bluetooth -l -c 2441 -C 40 --zmq-pub tcp://*:5555 --check-crc
+
+    # Dashboard with GPS map:
+    python3 tools/zmq_web_dashboard.py tcp://localhost:5555 --gps
+
+The `--gps` flag on the web dashboard enables a live map tab showing device
+locations. GPS fixes are polled from gpsd at 1 Hz with a local cache to
+avoid redundant queries.
+
 ### Architecture
 
 ```
