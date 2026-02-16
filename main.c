@@ -38,7 +38,7 @@
 
 #include "pfbch2.h"
 
-#ifdef USE_OPENCL_PFB
+#if defined(USE_OPENCL_PFB) || defined(USE_VKFFT_PFB)
 void init_pfb_gpu(int16_t *h_sub, unsigned M, unsigned m, unsigned h_sub_len);
 int8_t *get_next_raw_buffer(void);
 #endif
@@ -308,7 +308,7 @@ void *agc_dispatcher_thread(void *arg) {
 }
 #endif
 
-#ifdef USE_OPENCL_PFB
+#if defined(USE_OPENCL_PFB) || defined(USE_VKFFT_PFB)
 void *channelizer_thread(void *arg) {
     sample_buf_t *samples = NULL;
     int8_t *raw_buf = get_next_raw_buffer();
@@ -677,7 +677,7 @@ int main(int argc, char **argv) {
     float *h = malloc(sizeof(float) * h_len);
     liquid_firdes_kaiser(h_len, lp_cutoff/(float)channels, 60.0f, 0.0f, h);
     pfbch2_init(&magic, channels, m, h);
-#ifdef USE_OPENCL_PFB
+#if defined(USE_OPENCL_PFB) || defined(USE_VKFFT_PFB)
     init_pfb_gpu(magic.h_sub, channels, m, magic.h_sub_len);
 #endif
     init_fft(channels, BATCH_SIZE);
@@ -717,7 +717,7 @@ int main(int argc, char **argv) {
     while (running) {
         if (live && hackrf != NULL && !hackrf_is_streaming(hackrf))
             break;
-        pause();
+        usleep(100000);  // Sleep 100ms instead of pause() to allow Ctrl+C to work
     }
     running = 0;
 

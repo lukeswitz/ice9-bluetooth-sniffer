@@ -47,8 +47,8 @@ except ImportError:
 # PCAP structures (matching pcap.c)
 PCAP_GLOBAL_HDR = struct.Struct("<IHHiIII")
 PCAP_REC_HDR = struct.Struct("<IIII")      # ts_sec, ts_usec, incl_len, orig_len
-BLE_RF_HDR = struct.Struct("<bbbBIH")      # rf_channel, signal_power, noise_power,
-                                            # aa_offenses, ref_aa, flags
+BLE_RF_HDR = struct.Struct("<BbbBIH")      # uint8 rf_channel, int8 signal_power, int8 noise_power,
+                                            # uint8 aa_offenses, uint32 ref_aa, uint16 flags
 
 # ZMQ GPS frame (matches zmq_gps_frame_t in pcap.h)
 ZMQ_GPS_FRAME = struct.Struct("<ddd")      # latitude, longitude, altitude

@@ -20,5 +20,5 @@ typedef struct _window_t {
 void window_init(window_t *w, unsigned n);
 void window_release(window_t *w);
 void window_push(window_t *w, int8_t *v);
-void window_dotprod(window_t *w, int16_t *b, int16_t *out);
+void window_dotprod(window_t *w, int16_t * __restrict b, int16_t * __restrict out) __attribute__((hot));
 void window_dotprod_init(void);

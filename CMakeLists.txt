@@ -9,8 +9,13 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fno-common -Wall -Wextra -Wno-unused-parame
 if (UNIX AND NOT APPLE)
   if (CMAKE_SYSTEM_PROCESSOR MATCHES "arm|ARM")
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mfpu=neon")
+  elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
   else()
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -msse4.1")
+  endif()
+elseif (APPLE)
+  if (CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mcpu=apple-m1")
   endif()
 endif()
 
@@ -157,7 +162,7 @@ add_executable(ice9-bluetooth
 if(USE_VKFFT)
   include_directories("vkfft")
   set(VKFFT_BACKEND 5 CACHE STRING "5 - Metal")
-  add_definitions(-DVKFFT_BACKEND=${VKFFT_BACKEND})
+  add_definitions(-DVKFFT_BACKEND=${VKFFT_BACKEND} -DUSE_VKFFT_PFB)
 
   if(${VKFFT_BACKEND} EQUAL 5)
     add_compile_options(-WMTL_IGNORE_WARNINGS)
@@ -167,6 +172,45 @@ if(USE_VKFFT)
     target_link_libraries(ice9-bluetooth PRIVATE
       ${FOUNDATION_LIB} ${QUARTZ_CORE_LIB} ${METAL_LIB})
     target_include_directories(${PROJECT_NAME} PUBLIC "metal-cpp/")
+
+    # Compile Metal PFB kernel (optional - requires Metal toolchain)
+    execute_process(
+      COMMAND xcrun -sdk macosx metal --version
+      RESULT_VARIABLE METAL_FOUND
+      OUTPUT_QUIET ERROR_QUIET
+    )
+
+    if(METAL_FOUND EQUAL 0)
+      set(METAL_KERNEL_SRC "${PROJECT_SOURCE_DIR}/vkfft/pfb_kernel.metal")
+      set(METAL_AIR "${CMAKE_BINARY_DIR}/pfb_kernel.air")
+      set(METAL_LIB_FILE "${CMAKE_BINARY_DIR}/default.metallib")
+
+      add_custom_command(
+        OUTPUT ${METAL_AIR}
+        COMMAND xcrun -sdk macosx metal -c ${METAL_KERNEL_SRC} -o ${METAL_AIR}
+        DEPENDS ${METAL_KERNEL_SRC}
+        COMMENT "Compiling Metal kernel to AIR"
+      )
+
+      add_custom_command(
+        OUTPUT ${METAL_LIB_FILE}
+        COMMAND xcrun -sdk macosx metallib ${METAL_AIR} -o ${METAL_LIB_FILE}
+        DEPENDS ${METAL_AIR}
+        COMMENT "Linking Metal library"
+      )
+
+      add_custom_target(metal_kernels ALL DEPENDS ${METAL_LIB_FILE})
+      add_dependencies(ice9-bluetooth metal_kernels)
+
+      # Install metallib next to the executable
+      install(FILES ${METAL_LIB_FILE} DESTINATION bin)
+      message(STATUS "Metal PFB GPU acceleration enabled")
+    else()
+      message(WARNING "Metal toolchain not found - install with: xcodebuild -downloadComponent MetalToolchain")
+      message(STATUS "Metal PFB will be unavailable (CPU path will be used)")
+      # Remove USE_VKFFT_PFB flag if Metal is not available
+      remove_definitions(-DUSE_VKFFT_PFB)
+    endif()
   endif()
 elseif(USE_OPENCL_FFT)
   include_directories("vkfft")
@@ -215,22 +259,26 @@ set_property(TARGET ice9-bluetooth PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
 
 install(TARGETS ice9-bluetooth DESTINATION bin)
 
-if (EXTCAP_INSTALL_PATH)
-  if(POLICY CMP0087)
-    cmake_policy(SET CMP0087 NEW)
-  endif()
-  install(CODE "
-      execute_process(
-        COMMAND ${CMAKE_COMMAND} -E make_directory \$ENV{DESTDIR}${EXTCAP_INSTALL_PATH}/extcap/
-      )
-  ")
-  install(CODE "
-      execute_process(
-        COMMAND ${CMAKE_COMMAND} -E create_symlink
-        ${CMAKE_INSTALL_PREFIX}/bin/ice9-bluetooth \$ENV{DESTDIR}${EXTCAP_INSTALL_PATH}/extcap/ice9-bluetooth
-      )
-  ")
-endif()
+# Wireshark extcap symlink disabled - create manually in user directory:
+# mkdir -p ~/Library/Application\ Support/Wireshark/extcap
+# ln -sf /usr/local/bin/ice9-bluetooth ~/Library/Application\ Support/Wireshark/extcap/ice9-bluetooth
+#
+#if (EXTCAP_INSTALL_PATH)
+#  if(POLICY CMP0087)
+#    cmake_policy(SET CMP0087 NEW)
+#  endif()
+#  install(CODE "
+#      execute_process(
+#        COMMAND ${CMAKE_COMMAND} -E make_directory \$ENV{DESTDIR}${EXTCAP_INSTALL_PATH}/extcap/
+#      )
+#  ")
+#  install(CODE "
+#      execute_process(
+#        COMMAND ${CMAKE_COMMAND} -E create_symlink
+#        ${CMAKE_INSTALL_PREFIX}/bin/ice9-bluetooth \$ENV{DESTDIR}${EXTCAP_INSTALL_PATH}/extcap/ice9-bluetooth
+#      )
+#  ")
+#endif()
 
 # uninstall target
 if(NOT TARGET uninstall)

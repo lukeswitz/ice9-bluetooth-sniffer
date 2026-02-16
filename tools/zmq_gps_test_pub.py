@@ -34,7 +34,7 @@ except ImportError:
 
 # Structures matching pcap.c
 PCAP_REC_HDR = struct.Struct("<IIII")
-BLE_RF_HDR = struct.Struct("<bbbBIH")
+BLE_RF_HDR = struct.Struct("<BbbBIH")  # uint8 rf_channel, int8 signal_power, int8 noise_power, uint8 aa_offenses, uint32 ref_aa, uint16 flags
 ZMQ_GPS_FRAME = struct.Struct("<ddd")
 
 LE_DEWHITENED = 0x0001

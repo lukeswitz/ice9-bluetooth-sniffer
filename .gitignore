@@ -7,3 +7,6 @@ build/
 .vscode/
 *.key
 *.key.pub
+.DS_Store
+
+default.metallib

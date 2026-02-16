@@ -11,6 +11,7 @@
 #include "btbb/btbb.h"
 #include "pcap.h"
 
+static float rssi_calibration_offset = 0.0f;
 extern pcap_t *pcap;
 extern int check_crc;
 extern int verbose;
@@ -67,6 +68,10 @@ void bluetooth_init(void) {
         }
     }
     aa_template_norm = sqrtf(sum_sq);
+}
+
+void bluetooth_set_rssi_offset(float offset_db) {
+    rssi_calibration_offset = offset_db;
 }
 
 // Whitening bit lookup: index into pre-computed sequence at channel-specific offset
@@ -345,19 +350,25 @@ ble_packet_t *ble_burst(uint8_t *bits, unsigned bits_len, unsigned freq, struct 
     return NULL;
 }
 
-void bluetooth_detect(uint8_t *bits, unsigned len, float *demod, unsigned demod_len, unsigned silence_offset, unsigned freq, unsigned rssi, unsigned noise, struct timespec timestamp, uint32_t *lap_out, uint32_t *aa_out) {
+void bluetooth_detect(uint8_t *bits, unsigned len, float *demod, unsigned demod_len,
+                      unsigned silence_offset, unsigned freq, float rssi, float noise, 
+                      struct timespec timestamp, uint32_t *lap_out, uint32_t *aa_out) {
     uint32_t lap = btbb_find_ac((char *)bits, len, 1);
     if (lap != 0xffffffff) {
         *lap_out = lap;
     } else {
-        // Try preamble-first detection, then fall back to AA correlator
+        // Apply RSSI calibration
+        float calibrated_rssi = rssi + rssi_calibration_offset;
+        
+        // Try preamble-first detection...
         ble_packet_t *p = ble_burst(bits, len, freq, timestamp);
         if (p == NULL && demod != NULL)
             p = ble_burst_correlator(demod, demod_len, silence_offset, freq, timestamp);
 
         if (p != NULL) {
-            p->rssi_db = rssi;
-            p->noise_db = noise;
+            // Store calibrated RSSI
+            p->rssi_db = (int)roundf(calibrated_rssi);
+            p->noise_db = (int)roundf(noise);
             *aa_out = p->aa;
 
             // Track CRC statistics

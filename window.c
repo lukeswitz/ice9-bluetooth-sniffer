@@ -18,8 +18,8 @@ void window_init(window_t *w, unsigned n) {
     w->mask = w->n - 1;
 
     w->num_allocated = w->n + w->len - 1;
-    w->r = malloc(sizeof(int16_t) * w->num_allocated);
-    w->i = malloc(sizeof(int16_t) * w->num_allocated);
+    w->r = calloc(w->num_allocated, sizeof(int16_t));
+    w->i = calloc(w->num_allocated, sizeof(int16_t));
 }
 
 void window_release(window_t *w) {
@@ -41,27 +41,56 @@ void window_push(window_t *w, int8_t *v) {
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 #include <arm_neon.h>
 
-void window_dotprod(window_t *w, int16_t *b, int16_t *out) {
+static inline int32_t horizontal_sum_neon(int32x4_t v) {
+    int32x2_t sum2 = vpadd_s32(vget_low_s32(v), vget_high_s32(v));
+    int32x2_t sum1 = vpadd_s32(sum2, sum2);
+    return vget_lane_s32(sum1, 0);
+}
+
+void window_dotprod(window_t *w, int16_t * __restrict b, int16_t * __restrict out) {
     unsigned i;
-    int32x4_t real_acc = vdupq_n_s32(0), imag_acc = vdupq_n_s32(0);;
+    int32x4_t real_acc, imag_acc;
 
-    for (i = 0; i < w->len; i += 4) {
-        int16x4_t real_a_vec = vld1_s16(&w->r[w->read_index + i]);
-        int16x4_t imag_a_vec = vld1_s16(&w->i[w->read_index + i]);
-        int16x4_t b_vec = vld1_s16(&b[i]);
+    /* fast path for len=8 (most common with m=4) */
+    if (__builtin_expect(w->len == 8, 1)) {
+        int16x4_t real_a0 = vld1_s16(&w->r[w->read_index]);
+        int16x4_t real_a1 = vld1_s16(&w->r[w->read_index + 4]);
+        int16x4_t imag_a0 = vld1_s16(&w->i[w->read_index]);
+        int16x4_t imag_a1 = vld1_s16(&w->i[w->read_index + 4]);
+        int16x4_t b0 = vld1_s16(&b[0]);
+        int16x4_t b1 = vld1_s16(&b[4]);
 
-        int32x4_t real_a_ext = vmovl_s16(real_a_vec);
-        int32x4_t imag_a_ext = vmovl_s16(imag_a_vec);
-        int32x4_t b_ext = vmovl_s16(b_vec);
+        int32x4_t real_a0_ext = vmovl_s16(real_a0);
+        int32x4_t real_a1_ext = vmovl_s16(real_a1);
+        int32x4_t imag_a0_ext = vmovl_s16(imag_a0);
+        int32x4_t imag_a1_ext = vmovl_s16(imag_a1);
+        int32x4_t b0_ext = vmovl_s16(b0);
+        int32x4_t b1_ext = vmovl_s16(b1);
 
-        real_acc = vmlaq_s32(real_acc, real_a_ext, b_ext);
-        imag_acc = vmlaq_s32(imag_acc, imag_a_ext, b_ext);
+        real_acc = vmulq_s32(real_a0_ext, b0_ext);
+        real_acc = vmlaq_s32(real_acc, real_a1_ext, b1_ext);
+        imag_acc = vmulq_s32(imag_a0_ext, b0_ext);
+        imag_acc = vmlaq_s32(imag_acc, imag_a1_ext, b1_ext);
+    } else {
+        real_acc = vdupq_n_s32(0);
+        imag_acc = vdupq_n_s32(0);
+
+        for (i = 0; i < w->len; i += 4) {
+            int16x4_t real_a_vec = vld1_s16(&w->r[w->read_index + i]);
+            int16x4_t imag_a_vec = vld1_s16(&w->i[w->read_index + i]);
+            int16x4_t b_vec = vld1_s16(&b[i]);
+
+            int32x4_t real_a_ext = vmovl_s16(real_a_vec);
+            int32x4_t imag_a_ext = vmovl_s16(imag_a_vec);
+            int32x4_t b_ext = vmovl_s16(b_vec);
+
+            real_acc = vmlaq_s32(real_acc, real_a_ext, b_ext);
+            imag_acc = vmlaq_s32(imag_acc, imag_a_ext, b_ext);
+        }
     }
 
-    int32_t real_sum = vgetq_lane_s32(real_acc, 0) + vgetq_lane_s32(real_acc, 1) +
-                       vgetq_lane_s32(real_acc, 2) + vgetq_lane_s32(real_acc, 3);
-    int32_t imag_sum = vgetq_lane_s32(imag_acc, 0) + vgetq_lane_s32(imag_acc, 1) +
-                       vgetq_lane_s32(imag_acc, 2) + vgetq_lane_s32(imag_acc, 3);
+    int32_t real_sum = horizontal_sum_neon(real_acc);
+    int32_t imag_sum = horizontal_sum_neon(imag_acc);
 
     out[0] = real_sum >> 16;
     out[1] = imag_sum >> 16;

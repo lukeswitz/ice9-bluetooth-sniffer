@@ -9,7 +9,7 @@
 #include <time.h>
 
 void bluetooth_init(void);
-void bluetooth_detect(uint8_t *bits, unsigned len, float *demod, unsigned demod_len, unsigned silence_offset, unsigned freq, unsigned rssi, unsigned noise, struct timespec timestamp, uint32_t *lap_out, uint32_t *aa_out);
+void bluetooth_detect(uint8_t *bits, unsigned len, float *demod, unsigned demod_len, unsigned silence_offset, unsigned freq, float rssi, float noise, struct timespec timestamp, uint32_t *lap_out, uint32_t *aa_out);
 
 typedef struct _ble_packet_t {
     uint32_t aa;

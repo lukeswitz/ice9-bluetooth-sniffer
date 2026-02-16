@@ -128,7 +128,7 @@ def _resolve_rpa(mac_str):
 # ---------------------------------------------------------------------------
 PCAP_GLOBAL_HDR = struct.Struct("<IHHiIII")
 PCAP_REC_HDR = struct.Struct("<IIII")
-BLE_RF_HDR = struct.Struct("<bbbBIH")
+BLE_RF_HDR = struct.Struct("<BbbBIH")  # uint8 rf_channel, int8 signal_power, int8 noise_power, uint8 aa_offenses, uint32 ref_aa, uint16 flags
 ZMQ_GPS_FRAME = struct.Struct("<ddd")
 
 LE_DEWHITENED         = 0x0001
@@ -882,6 +882,21 @@ gps_enabled = False
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
+    def log_error(self, format, *args):
+        """Suppress connection reset errors from browser refreshes."""
+        if isinstance(args[0], str) and 'Connection reset' in args[0]:
+            return
+        if isinstance(args[0], str) and 'Broken pipe' in args[0]:
+            return
+        super().log_error(format, *args)
+
+    def handle(self):
+        """Handle requests with connection error suppression."""
+        try:
+            super().handle()
+        except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
+            pass  # Browser disconnected during refresh - ignore
+
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/" or path == "/index.html":
@@ -1042,6 +1057,10 @@ def zmq_receiver(endpoints, server_key_path, pcap_file, use_gps, bind_mode=False
         pkt = parse_ble_packet(pcap_data)
         if pkt:
             state.add_packet(pkt, gps_info)
+        else:
+            # DEBUG: Log parse failures
+            if state.total_packets < 5:
+                print(f"  DEBUG: parse_ble_packet returned None - pcap_data len={len(pcap_data)}", file=sys.stderr)
 
     sub.close()
     ctx.term()
@@ -1119,6 +1138,7 @@ tr.fresh td { background: #1a2a1a; }
 .org { color: #ca6; }
 .yel { color: #ec5; }
 .masked { color: #666; }
+td[data-col="rssi"] { font-family: 'Menlo', 'Monaco', 'Courier New', monospace; font-size: 12px; letter-spacing: -0.5px; }
 
 #map { flex: 1; width: 100%; }
 .empty { padding: 40px; text-align: center; color: #555; }
@@ -1190,7 +1210,7 @@ tr.fresh td { background: #1a2a1a; }
         <th data-col="name">name</th>
         <th data-col="services">services</th>
         <th data-col="type">type</th>
-        <th data-col="rssi">rssi</th>
+        <th data-col="rssi">signal (dBm)</th>
         <th data-col="est_dist">dist</th>
         <th data-col="pkts" class="count">pkts</th>
         <th data-col="crc">crc %</th>
@@ -1302,8 +1322,40 @@ function mfrLabel(d) {
 }
 
 function rssiLabel(d) {
-  if (d.rssi === d.rssi_min) return d.rssi;
-  return d.rssi_min + '/' + d.rssi_avg + '/' + d.rssi;
+  // Filter out invalid 0 values from each metric
+  const hasMin = d.rssi_min < 0;
+  const hasAvg = d.rssi_avg < 0;
+  const hasMax = d.rssi < 0;
+
+  if (!hasMin && !hasAvg && !hasMax) return '<span class="dim">--</span>';
+
+  // Use average for signal strength classification
+  const primary = hasAvg ? d.rssi_avg : (hasMax ? d.rssi : d.rssi_min);
+
+  // Signal strength classification based on average
+  let strength = 'poor', color = 'red';
+  if (primary >= -35) { strength = 'excellent'; color = 'grn'; }
+  else if (primary >= -45) { strength = 'good'; color = 'grn'; }
+  else if (primary >= -65) { strength = 'fair'; color = 'yel'; }
+  else if (primary >= -80) { strength = 'weak'; color = 'org'; }
+
+  // Build signal strength bar (5 levels with tighter thresholds)
+  const bars = ['▁▁▁▁', '▂▁▁▁', '▂▄▁▁', '▂▄▆▁', '▂▄▆█'];
+  let barIdx = 0;
+  if (primary >= -35) barIdx = 4;
+  else if (primary >= -45) barIdx = 3;
+  else if (primary >= -65) barIdx = 2;
+  else if (primary >= -80) barIdx = 1;
+
+  // Format the three values with proper handling of missing data
+  const minStr = hasMin ? d.rssi_min : '--';
+  const avgStr = hasAvg ? d.rssi_avg : '--';
+  const maxStr = hasMax ? d.rssi : '--';
+
+  // Display: [bar] min/avg/max
+  const tooltip = `Signal Strength: ${strength}\nMin: ${minStr} dBm\nAvg: ${avgStr} dBm\nMax: ${maxStr} dBm`;
+
+  return `<span class="${color}" title="${tooltip}" style="cursor:help;white-space:nowrap">${bars[barIdx]} ${minStr}/${avgStr}/${maxStr}</span>`;
 }
 
 function svcLabel(d) {
@@ -1344,7 +1396,7 @@ function renderDevices() {
       `<td class="blu">${d.name||''}</td>`+
       `<td class="dim">${svcLabel(d)}</td>`+
       `<td class="${isAdv?'blu':'org'}">${d.type}</td>`+
-      `<td>${rssiLabel(d)}</td>`+
+      `<td data-col="rssi">${rssiLabel(d)}</td>`+
       `<td class="dim">${dist}</td>`+
       `<td class="count">${d.pkts.toLocaleString()}</td>`+
       `<td class="${crcCls}">${crcPct}</td>`+
