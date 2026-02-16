@@ -49,6 +49,7 @@ extern int zmq_pub_active;
 extern int zmq_connect_mode;
 extern char *zmq_endpoint;
 extern char *zmq_curve_keyfile;
+extern char *sensor_id;
 #endif
 #ifdef HAVE_GPS
 extern int gpsd_active;
@@ -154,6 +155,7 @@ void parse_options(int argc, char **argv) {
         { "zmq-pub", required_argument, NULL, 'Z' },
         { "zmq-connect", required_argument, NULL, 'X' },
         { "zmq-curve-key", required_argument, NULL, 'K' },
+        { "sensor-id", required_argument, NULL, 0x100 },
 #endif
 #ifdef HAVE_GPS
         { "gpsd", no_argument, NULL, 'G' },
@@ -249,6 +251,10 @@ void parse_options(int argc, char **argv) {
 
             case 'K':
                 zmq_curve_keyfile = strdup(optarg);
+                break;
+
+            case 0x100:
+                sensor_id = strdup(optarg);
                 break;
 #endif
 

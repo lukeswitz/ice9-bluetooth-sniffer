@@ -79,6 +79,7 @@ int zmq_pub_active = 0;
 int zmq_connect_mode = 0;
 char *zmq_endpoint = NULL;
 char *zmq_curve_keyfile = NULL;
+char *sensor_id = NULL;
 #endif
 #ifdef HAVE_GPS
 int gpsd_active = 0;
@@ -643,8 +644,16 @@ int main(int argc, char **argv) {
         if (zmq_pub_init(zmq_endpoint, zmq_curve_keyfile, zmq_connect_mode) != 0)
             errx(1, "Failed to %s ZMQ PUB socket on %s",
                  zmq_connect_mode ? "connect" : "bind", zmq_endpoint);
-        fprintf(stderr, "ZMQ PUB: %s (%s)\n", zmq_endpoint,
-                zmq_connect_mode ? "connect" : "bind");
+        if (sensor_id == NULL) {
+            sensor_id = malloc(256);
+            if (gethostname(sensor_id, 256) != 0)
+                snprintf(sensor_id, 256, "sensor");
+            /* Avoid 24-byte length (ambiguous with GPS frame) */
+            if (strlen(sensor_id) == 24)
+                strcat(sensor_id, "-");
+        }
+        fprintf(stderr, "ZMQ PUB: %s (%s) sensor-id=%s\n", zmq_endpoint,
+                zmq_connect_mode ? "connect" : "bind", sensor_id);
     }
 #endif
 

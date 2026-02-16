@@ -40,6 +40,7 @@ Requirements:
 
 import argparse
 import json
+import math
 import os
 import queue
 import signal
@@ -615,10 +616,106 @@ def parse_ble_packet(data):
 
 
 # ---------------------------------------------------------------------------
+# Multilateration (position estimation from multiple sensors)
+# ---------------------------------------------------------------------------
+def _haversine_m(lat1, lon1, lat2, lon2):
+    """Haversine distance in meters between two lat/lon points."""
+    R = 6371000
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (math.sin(dlat / 2) ** 2 +
+         math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
+         math.sin(dlon / 2) ** 2)
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def _estimate_device_position(sensor_obs, sensors, tx_power, path_loss_exp):
+    """Estimate device position from multiple sensor distance estimates.
+
+    Returns (lat, lon, uncertainty_m, num_sensors) or None.
+    """
+    points = []
+    for sid, obs in sensor_obs.items():
+        s = sensors.get(sid)
+        if not s or s["lat"] is None:
+            continue
+        if obs["rssi_cnt"] == 0:
+            continue
+        rssi_avg = obs["rssi_sum"] / obs["rssi_cnt"]
+        measured_1m = tx_power - 41
+        dist = 10 ** ((measured_1m - rssi_avg) / (10.0 * path_loss_exp))
+        weight = min(obs["rssi_cnt"], 100) / 100.0
+        points.append((s["lat"], s["lon"], dist, weight))
+
+    if len(points) < 2:
+        return None
+
+    # Initial guess: centroid
+    lat0 = sum(p[0] for p in points) / len(points)
+    lon0 = sum(p[1] for p in points) / len(points)
+    m_per_deg_lat = 111320.0
+    m_per_deg_lon = 111320.0 * math.cos(math.radians(lat0))
+
+    sensors_m = [(
+        (lon - lon0) * m_per_deg_lon,
+        (lat - lat0) * m_per_deg_lat,
+        dist, w
+    ) for lat, lon, dist, w in points]
+
+    # Gauss-Newton weighted least squares
+    x_est, y_est = 0.0, 0.0
+    for _ in range(20):
+        A = []
+        b = []
+        W = []
+        for sx, sy, sd, sw in sensors_m:
+            dx = x_est - sx
+            dy = y_est - sy
+            d_calc = math.sqrt(dx * dx + dy * dy)
+            if d_calc < 0.1:
+                d_calc = 0.1
+            A.append([dx / d_calc, dy / d_calc])
+            b.append(sd - d_calc)
+            W.append(sw)
+
+        n = len(A)
+        ATA = [[0, 0], [0, 0]]
+        ATb = [0, 0]
+        for i in range(n):
+            for j in range(2):
+                for k in range(2):
+                    ATA[j][k] += W[i] * A[i][j] * A[i][k]
+                ATb[j] += W[i] * A[i][j] * b[i]
+
+        det = ATA[0][0] * ATA[1][1] - ATA[0][1] * ATA[1][0]
+        if abs(det) < 1e-10:
+            break
+        ddx = (ATA[1][1] * ATb[0] - ATA[0][1] * ATb[1]) / det
+        ddy = (-ATA[1][0] * ATb[0] + ATA[0][0] * ATb[1]) / det
+        x_est += ddx
+        y_est += ddy
+        if abs(ddx) < 0.01 and abs(ddy) < 0.01:
+            break
+
+    est_lat = lat0 + y_est / m_per_deg_lat
+    est_lon = lon0 + x_est / m_per_deg_lon
+
+    residuals = []
+    for sx, sy, sd, sw in sensors_m:
+        dx = x_est - sx
+        dy = y_est - sy
+        d_calc = math.sqrt(dx * dx + dy * dy)
+        residuals.append((sd - d_calc) ** 2 * sw)
+    uncertainty = math.sqrt(sum(residuals) / max(len(residuals), 1))
+
+    return (est_lat, est_lon, uncertainty, len(points))
+
+
+# ---------------------------------------------------------------------------
 # Shared dashboard state (device-centric, Kismet-style)
 # ---------------------------------------------------------------------------
 class DashboardState:
-    def __init__(self):
+    def __init__(self, static_positions=None, path_loss_exp=2.0):
         self.lock = threading.Lock()
         self.total_packets = 0
         self.crc_valid = 0
@@ -633,8 +730,13 @@ class DashboardState:
         # Channel activity: rf_channel -> packet count
         self.channel_counts = {}
         self._dirty = True
+        # Multi-sensor tracking
+        self.sensors = {}  # sensor_id -> {lat, lon, last_seen, pkts}
+        self.device_sensor_rssi = {}  # dev_key -> {sensor_id -> {rssi_sum, rssi_cnt, last}}
+        self.static_positions = static_positions or {}
+        self.path_loss_exp = path_loss_exp
 
-    def add_packet(self, pkt, gps_info=None):
+    def add_packet(self, pkt, gps_info=None, sensor_id=None):
         with self.lock:
             self.total_packets += 1
             if pkt["crc_checked"]:
@@ -645,6 +747,22 @@ class DashboardState:
             if gps_info:
                 self.gps_count += 1
                 self.last_gps = gps_info
+
+            # Update sensor state
+            if sensor_id:
+                if sensor_id not in self.sensors:
+                    self.sensors[sensor_id] = {"lat": None, "lon": None,
+                                               "last_seen": 0, "pkts": 0}
+                s = self.sensors[sensor_id]
+                s["last_seen"] = time.time()
+                s["pkts"] += 1
+                if gps_info:
+                    s["lat"] = round(gps_info[0], 6)
+                    s["lon"] = round(gps_info[1], 6)
+                elif sensor_id in self.static_positions:
+                    pos = self.static_positions[sensor_id]
+                    s["lat"] = pos[0]
+                    s["lon"] = pos[1]
 
             # Track channel activity
             rf_ch = pkt.get("rf_channel")
@@ -745,6 +863,18 @@ class DashboardState:
                     d["lat"] = round(gps_info[0], 6)
                     d["lon"] = round(gps_info[1], 6)
                 self.devices[dev_key] = d
+
+            # Per-sensor RSSI tracking (for multilateration)
+            if sensor_id:
+                if dev_key not in self.device_sensor_rssi:
+                    self.device_sensor_rssi[dev_key] = {}
+                dsr = self.device_sensor_rssi[dev_key]
+                if sensor_id not in dsr:
+                    dsr[sensor_id] = {"rssi_sum": 0, "rssi_cnt": 0, "last": 0}
+                dsr[sensor_id]["rssi_sum"] += rssi
+                dsr[sensor_id]["rssi_cnt"] += 1
+                dsr[sensor_id]["last"] = now
+
             self._dirty = True
 
     def get_stats(self):
@@ -777,9 +907,24 @@ class DashboardState:
                 tx = d.get("tx_pwr")
                 if tx is not None and dd["rssi_avg"] < 0:
                     measured = tx - 41  # RSSI at 1m for BLE 2.4 GHz
-                    dd["est_dist"] = round(10 ** ((measured - dd["rssi_avg"]) / 20.0), 1)
+                    dd["est_dist"] = round(10 ** ((measured - dd["rssi_avg"]) / (10.0 * self.path_loss_exp)), 1)
                 else:
                     dd["est_dist"] = None
+                # Multilateration
+                dev_key = d["mac"]
+                dd["est_lat"] = None
+                dd["est_lon"] = None
+                dd["est_unc"] = None
+                dd["num_sensors"] = 0
+                if tx is not None and dev_key in self.device_sensor_rssi:
+                    obs = self.device_sensor_rssi[dev_key]
+                    result = _estimate_device_position(
+                        obs, self.sensors, tx, self.path_loss_exp)
+                    if result:
+                        dd["est_lat"] = round(result[0], 6)
+                        dd["est_lon"] = round(result[1], 6)
+                        dd["est_unc"] = round(result[2], 1)
+                        dd["num_sensors"] = result[3]
                 # IRK resolution fields
                 rpa_addrs = d.get("rpa_addrs")
                 dd["identity"] = d.get("identity")
@@ -792,6 +937,25 @@ class DashboardState:
                 devs.append(dd)
             devs.sort(key=lambda x: x["last"], reverse=True)
             return devs
+
+    def get_sensors(self):
+        """Return list of known sensors with their positions."""
+        with self.lock:
+            result = []
+            seen = set()
+            for sid, s in self.sensors.items():
+                seen.add(sid)
+                result.append({
+                    "id": sid, "lat": s["lat"], "lon": s["lon"],
+                    "last_seen": s["last_seen"], "pkts": s["pkts"],
+                })
+            for label, (lat, lon) in self.static_positions.items():
+                if label not in seen:
+                    result.append({
+                        "id": label, "lat": lat, "lon": lon,
+                        "last_seen": 0, "pkts": 0,
+                    })
+            return result
 
     def get_summary(self):
         """Return aggregate breakdowns for the summary tab."""
@@ -894,6 +1058,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._serve_json(state.get_devices())
         elif path == "/api/summary":
             self._serve_json(state.get_summary())
+        elif path == "/api/sensors":
+            self._serve_json(state.get_sensors())
         elif path == "/api/export.csv":
             self._serve_csv()
         elif path == "/api/export.json":
@@ -923,7 +1089,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         cols = ["mac", "mac_type", "identity", "rpa_count", "mfr", "apple",
                 "name", "appear", "services", "type", "rssi", "rssi_min",
-                "rssi_avg", "tx_pwr", "est_dist", "pkts", "crc_ok",
+                "rssi_avg", "tx_pwr", "est_dist", "num_sensors",
+                "est_lat", "est_lon", "est_unc", "pkts", "crc_ok",
                 "crc_bad", "freq", "first", "last"]
         self.wfile.write((",".join(cols) + "\n").encode())
         for d in devs:
@@ -966,7 +1133,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 devs = state.get_devices()
                 stats = state.get_stats()
                 summary = state.get_summary()
-                payload = json.dumps({"stats": stats, "devices": devs, "summary": summary})
+                sensors = state.get_sensors()
+                payload = json.dumps({"stats": stats, "devices": devs,
+                                      "summary": summary, "sensors": sensors})
                 self.wfile.write(f"event: update\ndata: {payload}\n\n".encode())
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionError, OSError):
@@ -984,66 +1153,140 @@ class DashboardHandler(BaseHTTPRequestHandler):
 running = True
 
 
+def parse_zmq_frames(frames):
+    """Parse ZMQ multipart message, returning (sensor_id, gps_info, pcap_data).
+
+    Handles all frame formats:
+      1 frame:  [PCAP]                     -> (None, None, pcap)
+      2 frames: [GPS_24b] [PCAP]           -> (None, gps, pcap)   legacy
+      2 frames: [SENSOR_ID] [PCAP]         -> (id, None, pcap)    new, no GPS
+      3 frames: [SENSOR_ID] [GPS_24b] [PCAP] -> (id, gps, pcap)  new, with GPS
+    """
+    sensor_id = None
+    gps_info = None
+
+    if len(frames) == 1:
+        pcap_data = frames[0]
+    elif len(frames) == 2:
+        if len(frames[0]) == ZMQ_GPS_FRAME.size:
+            lat, lon, alt = ZMQ_GPS_FRAME.unpack(frames[0])
+            if -90 <= lat <= 90 and -180 <= lon <= 180:
+                gps_info = (lat, lon, alt)
+            else:
+                sensor_id = frames[0].decode("utf-8", errors="replace")
+        else:
+            sensor_id = frames[0].decode("utf-8", errors="replace")
+        pcap_data = frames[1]
+    elif len(frames) >= 3:
+        sensor_id = frames[0].decode("utf-8", errors="replace")
+        if len(frames[1]) == ZMQ_GPS_FRAME.size:
+            lat, lon, alt = ZMQ_GPS_FRAME.unpack(frames[1])
+            gps_info = (lat, lon, alt)
+        pcap_data = frames[-1]
+    else:
+        return None, None, None
+
+    return sensor_id, gps_info, pcap_data
+
+
+def _process_zmq_message(frames, pcap_file, use_gps, fallback_sensor_id=None):
+    """Process a ZMQ message: parse frames, write PCAP, update state."""
+    sensor_id, gps_info, pcap_data = parse_zmq_frames(frames)
+    if pcap_data is None:
+        return
+
+    if sensor_id is None:
+        sensor_id = fallback_sensor_id
+
+    # Write PCAP if requested
+    if pcap_file:
+        if use_gps:
+            ts_sec, ts_usec, incl_len, orig_len = PCAP_REC_HDR.unpack_from(pcap_data, 0)
+            payload = pcap_data[PCAP_REC_HDR.size:]
+            if gps_info:
+                ppi_hdr = build_ppi_gps_header(*gps_info)
+            else:
+                ppi_hdr = build_ppi_passthrough_header()
+            new_len = len(ppi_hdr) + len(payload)
+            pcap_file.write(PCAP_REC_HDR.pack(ts_sec, ts_usec, new_len, new_len))
+            pcap_file.write(ppi_hdr)
+            pcap_file.write(payload)
+            pcap_file.flush()
+        else:
+            pcap_file.write(pcap_data)
+            pcap_file.flush()
+
+    pkt = parse_ble_packet(pcap_data)
+    if pkt:
+        state.add_packet(pkt, gps_info, sensor_id)
+
+
 def zmq_receiver(endpoints, server_key_path, pcap_file, use_gps, bind_mode=False):
     ctx = zmq.Context()
-    sub = ctx.socket(zmq.SUB)
-    sub.setsockopt(zmq.SUBSCRIBE, b"")
-    sub.setsockopt(zmq.RCVTIMEO, 1000)
 
-    if server_key_path:
-        server_public_key = parse_server_pubkey(server_key_path)
-        client_public, client_secret = zmq.curve_keypair()
-        sub.setsockopt(zmq.CURVE_SERVERKEY, server_public_key)
-        sub.setsockopt(zmq.CURVE_PUBLICKEY, client_public)
-        sub.setsockopt(zmq.CURVE_SECRETKEY, client_secret)
-
-    for ep in endpoints:
-        if bind_mode:
+    if bind_mode:
+        # Bind mode: single socket, sensor ID comes from ZMQ frame
+        sub = ctx.socket(zmq.SUB)
+        sub.setsockopt(zmq.SUBSCRIBE, b"")
+        sub.setsockopt(zmq.RCVTIMEO, 1000)
+        if server_key_path:
+            server_public_key = parse_server_pubkey(server_key_path)
+            client_public, client_secret = zmq.curve_keypair()
+            sub.setsockopt(zmq.CURVE_SERVERKEY, server_public_key)
+            sub.setsockopt(zmq.CURVE_PUBLICKEY, client_public)
+            sub.setsockopt(zmq.CURVE_SECRETKEY, client_secret)
+        for ep in endpoints:
             sub.bind(ep)
             print(f"  Listening on {ep} (bind mode)", file=sys.stderr)
-        else:
+
+        while running:
+            try:
+                frames = sub.recv_multipart()
+            except zmq.Again:
+                continue
+            except zmq.ZMQError:
+                break
+            _process_zmq_message(frames, pcap_file, use_gps)
+
+        sub.close()
+    else:
+        # Connect mode: one socket per endpoint for sensor identification
+        poller = zmq.Poller()
+        sockets = {}  # socket -> endpoint label
+        for ep in endpoints:
+            sub = ctx.socket(zmq.SUB)
+            sub.setsockopt(zmq.SUBSCRIBE, b"")
+            sub.setsockopt(zmq.RCVTIMEO, 1000)
+            if server_key_path:
+                server_public_key = parse_server_pubkey(server_key_path)
+                client_public, client_secret = zmq.curve_keypair()
+                sub.setsockopt(zmq.CURVE_SERVERKEY, server_public_key)
+                sub.setsockopt(zmq.CURVE_PUBLICKEY, client_public)
+                sub.setsockopt(zmq.CURVE_SECRETKEY, client_secret)
             sub.connect(ep)
+            sockets[sub] = ep
+            poller.register(sub, zmq.POLLIN)
             print(f"  Connected to {ep}", file=sys.stderr)
 
-    while running:
-        try:
-            frames = sub.recv_multipart()
-        except zmq.Again:
-            continue
-        except zmq.ZMQError:
-            break
+        while running:
+            try:
+                ready = dict(poller.poll(1000))
+            except zmq.ZMQError:
+                break
 
-        gps_info = None
-        if len(frames) >= 2 and len(frames[0]) == ZMQ_GPS_FRAME.size:
-            lat, lon, alt = ZMQ_GPS_FRAME.unpack(frames[0])
-            gps_info = (lat, lon, alt)
-            pcap_data = frames[1]
-        else:
-            pcap_data = frames[-1]
+            for sock, label in sockets.items():
+                if sock not in ready:
+                    continue
+                try:
+                    frames = sock.recv_multipart(zmq.NOBLOCK)
+                except zmq.Again:
+                    continue
+                _process_zmq_message(frames, pcap_file, use_gps,
+                                     fallback_sensor_id=label)
 
-        # Write PCAP if requested
-        if pcap_file:
-            if use_gps:
-                ts_sec, ts_usec, incl_len, orig_len = PCAP_REC_HDR.unpack_from(pcap_data, 0)
-                payload = pcap_data[PCAP_REC_HDR.size:]
-                if gps_info:
-                    ppi_hdr = build_ppi_gps_header(*gps_info)
-                else:
-                    ppi_hdr = build_ppi_passthrough_header()
-                new_len = len(ppi_hdr) + len(payload)
-                pcap_file.write(PCAP_REC_HDR.pack(ts_sec, ts_usec, new_len, new_len))
-                pcap_file.write(ppi_hdr)
-                pcap_file.write(payload)
-                pcap_file.flush()
-            else:
-                pcap_file.write(pcap_data)
-                pcap_file.flush()
+        for sock in sockets:
+            sock.close()
 
-        pkt = parse_ble_packet(pcap_data)
-        if pkt:
-            state.add_packet(pkt, gps_info)
-
-    sub.close()
     ctx.term()
 
 
@@ -1192,6 +1435,7 @@ tr.fresh td { background: #1a2a1a; }
         <th data-col="type">type</th>
         <th data-col="rssi">rssi</th>
         <th data-col="est_dist">dist</th>
+        <th data-col="num_sensors">sensors</th>
         <th data-col="pkts" class="count">pkts</th>
         <th data-col="crc">crc %</th>
         <th data-col="first">first seen</th>
@@ -1346,6 +1590,7 @@ function renderDevices() {
       `<td class="${isAdv?'blu':'org'}">${d.type}</td>`+
       `<td>${rssiLabel(d)}</td>`+
       `<td class="dim">${dist}</td>`+
+      `<td class="dim">${d.num_sensors||''}</td>`+
       `<td class="count">${d.pkts.toLocaleString()}</td>`+
       `<td class="${crcCls}">${crcPct}</td>`+
       `<td class="dim">${fmtT(d.first)}</td>`;
@@ -1453,6 +1698,74 @@ function updStats(s) {
   }
 }
 
+/* --- Multi-sensor map markers --- */
+let sensorMarkers = {};
+let deviceMarkers = {};
+
+function updateSensors(sensors) {
+  if (!map) return;
+  for (const s of sensors) {
+    if (s.lat == null || s.lon == null) continue;
+    if (sensorMarkers[s.id]) {
+      sensorMarkers[s.id].setLatLng([s.lat, s.lon]);
+      sensorMarkers[s.id].unbindTooltip();
+      sensorMarkers[s.id].bindTooltip(s.id+' ('+s.pkts.toLocaleString()+' pkts)');
+    } else {
+      const m = L.marker([s.lat, s.lon], {
+        icon: L.divIcon({
+          className: '',
+          html: '<div style="background:#f80;color:#000;padding:2px 6px;border-radius:3px;font:bold 10px monospace;white-space:nowrap;border:1px solid #a50">'+s.id+'</div>',
+          iconSize: null, iconAnchor: [0, 0]
+        })
+      }).addTo(map);
+      m.bindTooltip(s.id+' ('+s.pkts.toLocaleString()+' pkts)');
+      sensorMarkers[s.id] = m;
+      map.setView([s.lat, s.lon], 15);
+    }
+  }
+}
+
+function updateDevicePositions(devs) {
+  if (!map) return;
+  const now = Date.now()/1000;
+  const shown = new Set();
+  for (const d of devs) {
+    if (d.est_lat == null || d.est_lon == null) continue;
+    const key = d.mac;
+    shown.add(key);
+    let color = d.num_sensors >= 3 ? '#4c4' : d.num_sensors === 2 ? '#cc4' : '#c44';
+    const unc = d.est_unc || 50;
+    const label = priv ? 'device' : (d.name || d.mac);
+    const tip = label+' ~'+(d.est_dist||'?')+'m, '+d.num_sensors+' sensor'+(d.num_sensors!==1?'s':'');
+    if (deviceMarkers[key]) {
+      deviceMarkers[key].dot.setLatLng([d.est_lat, d.est_lon]);
+      deviceMarkers[key].ring.setLatLng([d.est_lat, d.est_lon]);
+      deviceMarkers[key].ring.setRadius(unc);
+      deviceMarkers[key].dot.setStyle({color:color, fillColor:color});
+      deviceMarkers[key].ring.setStyle({color:color, fillColor:color});
+      deviceMarkers[key].dot.unbindTooltip();
+      deviceMarkers[key].dot.bindTooltip(tip);
+    } else {
+      const dot = L.circleMarker([d.est_lat, d.est_lon], {
+        radius:5, color:color, fillColor:color, fillOpacity:0.7, weight:1
+      }).addTo(map);
+      const ring = L.circle([d.est_lat, d.est_lon], {
+        radius:unc, color:color, fillColor:color, fillOpacity:0.1,
+        weight:1, dashArray:'4 4'
+      }).addTo(map);
+      dot.bindTooltip(tip);
+      deviceMarkers[key] = {dot, ring};
+    }
+  }
+  for (const key of Object.keys(deviceMarkers)) {
+    if (!shown.has(key)) {
+      map.removeLayer(deviceMarkers[key].dot);
+      map.removeLayer(deviceMarkers[key].ring);
+      delete deviceMarkers[key];
+    }
+  }
+}
+
 if (GPS) {
   const tab = document.createElement('div');
   tab.className = 'tab';
@@ -1481,6 +1794,8 @@ es.addEventListener('update', e => {
   updStats(d.stats);
   renderDevices();
   if (curTab === 'summary') renderSummary(summary);
+  if (d.sensors && map) updateSensors(d.sensors);
+  if (devices && map) updateDevicePositions(devices);
 });
 </script>
 </body>
@@ -1511,6 +1826,10 @@ def main():
                         help="Download/update Bluetooth numbers database from Nordic Semiconductor, then run")
     parser.add_argument("--irk-file", metavar="FILE",
                         help="File of IRKs for RPA resolution (format: label:hex per line)")
+    parser.add_argument("--sensor-pos", action="append", metavar="LABEL:LAT,LON",
+                        help="Static position for sensor without GPS (repeatable)")
+    parser.add_argument("--path-loss-exp", type=float, default=2.0,
+                        help="Path loss exponent for distance estimation (default: 2.0)")
     args = parser.parse_args()
 
     # Update Bluetooth numbers database if requested
@@ -1531,6 +1850,23 @@ def main():
             print("  Warning: no valid IRKs found in file", file=sys.stderr)
 
     gps_enabled = args.gps
+
+    # Parse static sensor positions
+    static_positions = {}
+    if args.sensor_pos:
+        for sp in args.sensor_pos:
+            try:
+                label, coords = sp.split(":", 1)
+                lat, lon = coords.split(",")
+                static_positions[label.strip()] = (float(lat), float(lon))
+            except (ValueError, IndexError):
+                print(f"  Warning: invalid --sensor-pos '{sp}' (expected LABEL:LAT,LON)",
+                      file=sys.stderr)
+
+    # Re-initialize state with multilateration config
+    global state
+    state = DashboardState(static_positions=static_positions,
+                           path_loss_exp=args.path_loss_exp)
 
     def sig_handler(sig, frame):
         global running
@@ -1569,7 +1905,11 @@ def main():
     print(f"  Privacy:    MAC addresses hidden by default", file=sys.stderr)
     if _irk_list:
         print(f"  IRK file:   {args.irk_file} ({len(_irk_list)} key(s))", file=sys.stderr)
-    print(f"  Distance:   estimated from TX power + RSSI (free space)", file=sys.stderr)
+    n = args.path_loss_exp
+    print(f"  Distance:   estimated from TX power + RSSI (n={n})", file=sys.stderr)
+    if static_positions:
+        for label, (lat, lon) in static_positions.items():
+            print(f"  Sensor pos: {label} ({lat}, {lon})", file=sys.stderr)
     print(f"  {'='*40}\n", file=sys.stderr)
 
     try:

@@ -19,6 +19,7 @@ extern int gpsd_active;
 
 static void *zmq_ctx = NULL;
 static void *zmq_pub = NULL;
+extern char *sensor_id;
 #endif
 
 struct _pcap_t {
@@ -242,6 +243,8 @@ static void zmq_pub_packet(pcaprec_hdr_t *ph, pcap_le_header_t *lh, uint8_t *dat
     memcpy(buf, ph, sizeof(*ph));
     memcpy(buf + sizeof(*ph), lh, sizeof(*lh));
     memcpy(buf + sizeof(*ph) + sizeof(*lh), data, len);
+    if (sensor_id)
+        zmq_send(zmq_pub, sensor_id, strlen(sensor_id), ZMQ_DONTWAIT | ZMQ_SNDMORE);
     zmq_send(zmq_pub, buf, msg_len, ZMQ_DONTWAIT);
     free(buf);
 }
@@ -257,7 +260,9 @@ static void zmq_pub_packet_gps(zmq_gps_frame_t *gps, pcaprec_hdr_t *ph, pcap_le_
     memcpy(buf + sizeof(*ph), lh, sizeof(*lh));
     memcpy(buf + sizeof(*ph) + sizeof(*lh), data, len);
 
-    /* Send as multipart: frame 1 = GPS, frame 2 = PCAP record */
+    /* Send as multipart: [sensor_id] [GPS] [PCAP record] */
+    if (sensor_id)
+        zmq_send(zmq_pub, sensor_id, strlen(sensor_id), ZMQ_DONTWAIT | ZMQ_SNDMORE);
     zmq_send(zmq_pub, gps, sizeof(*gps), ZMQ_DONTWAIT | ZMQ_SNDMORE);
     zmq_send(zmq_pub, buf, msg_len, ZMQ_DONTWAIT);
     free(buf);
