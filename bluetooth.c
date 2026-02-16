@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "bluetooth.h"
 #include "btbb/btbb.h"
@@ -72,6 +73,12 @@ void bluetooth_init(void) {
 
 void bluetooth_set_rssi_offset(float offset_db) {
     rssi_calibration_offset = offset_db;
+}
+
+void bluetooth_init_rssi_calibration(const char *sdr_name, int gain, unsigned channels) {
+    rssi_calibration_offset = 20.0f * log10f((float)channels);
+    fprintf(stderr, "RSSI: compensating for FFT 1/%u scaling = +%.1f dB\n",
+            channels, rssi_calibration_offset);
 }
 
 // Whitening bit lookup: index into pre-computed sequence at channel-specific offset
@@ -359,7 +366,7 @@ void bluetooth_detect(uint8_t *bits, unsigned len, float *demod, unsigned demod_
     } else {
         // Apply RSSI calibration
         float calibrated_rssi = rssi + rssi_calibration_offset;
-        
+
         // Try preamble-first detection...
         ble_packet_t *p = ble_burst(bits, len, freq, timestamp);
         if (p == NULL && demod != NULL)

@@ -3,6 +3,8 @@
  */
 
 #include <complex.h>
+#include <math.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -44,20 +46,23 @@ void burst_catcher_destroy(burst_catcher_t *c) {
 
 int burst_catcher_execute(burst_catcher_t *c, float complex *sample, burst_t *burst_out) {
     agc_crcf_execute(c->agc, *sample, sample);
+
     if (agc_crcf_squelch_get_status(c->agc) == LIQUID_AGC_SQUELCH_SIGNALHI) {
         if (c->burst_len == c->burst_buf_size && c->burst_len < MAX_BURST_SIZE) {
             c->burst_buf_size *= 2;
             float complex *new_burst = realloc(c->burst, sizeof(float complex) * c->burst_buf_size);
             if (new_burst == NULL) {
-                c->burst_buf_size /= 2;  // Revert size, keep existing buffer
+                c->burst_buf_size /= 2;
             } else {
                 c->burst = new_burst;
             }
         }
         if (c->burst_len < MAX_BURST_SIZE)
             c->burst[c->burst_len++] = *sample;
-        if (c->burst_len == BURST_RSSI_OFFSET)
+
+        if (c->burst_len == BURST_RSSI_OFFSET) {
             c->burst_rssi = agc_crcf_get_rssi(c->agc);
+        }
     } else if (agc_crcf_squelch_get_status(c->agc) == LIQUID_AGC_SQUELCH_RISE) {
         c->burst = malloc(sizeof(float complex) * BURST_START_SIZE);
         c->burst_buf_size = BURST_START_SIZE;
@@ -71,7 +76,6 @@ int burst_catcher_execute(burst_catcher_t *c, float complex *sample, burst_t *bu
         burst_out->freq = c->freq;
         burst_out->timestamp = c->timestamp;
         burst_out->rssi_db = c->burst_rssi;
-        // grab the noise level after the burst has ended
         burst_out->noise_db = agc_crcf_get_rssi(c->agc);
         c->burst = NULL;
         c->burst_len = 0;

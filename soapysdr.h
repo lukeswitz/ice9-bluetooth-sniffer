@@ -7,6 +7,8 @@
 
 #include <SoapySDR/Device.h>
 
+extern const double soapy_gain_val;
+
 void soapy_list(void);
 SoapySDRDevice *soapy_setup(int id);
 void *soapy_stream_thread(void *arg);

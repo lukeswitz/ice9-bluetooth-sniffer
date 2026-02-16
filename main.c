@@ -671,6 +671,18 @@ int main(int argc, char **argv) {
     }
     gen_syndrome_map(1);
     bluetooth_init();
+
+    if (bladerf != NULL)
+        bluetooth_init_rssi_calibration("bladerf", 30, channels);
+    else if (hackrf != NULL)
+        bluetooth_init_rssi_calibration("hackrf", 64, channels);
+    else if (usrp != NULL)
+        bluetooth_init_rssi_calibration("usrp", 60, channels);
+    else if (soapy != NULL)
+        bluetooth_init_rssi_calibration("soapysdr", 40, channels);
+    else
+        bluetooth_init_rssi_calibration("unknown", 0, channels);
+
     window_dotprod_init();
 
     unsigned h_len = 2*channels*m + 1;

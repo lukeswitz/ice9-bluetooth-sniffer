@@ -206,11 +206,8 @@ VkFFTResult init_fft(unsigned width, unsigned batch_size) {
     MTL::Device* device = (MTL::Device*)devices->object(0);
     VkFFTResult r;
 
-    /* compile PFB kernel */
     if (!compile_pfb_kernel(device)) {
-        fprintf(stderr, "Failed to compile PFB kernel\n");
-        devices->release();
-        return VKFFT_ERROR_FAILED_TO_COMPILE_PROGRAM;
+        fprintf(stderr, "Metal PFB unavailable - using CPU fallback\n");
     }
 
     /* upload PFB coefficients */

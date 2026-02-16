@@ -18,6 +18,10 @@ typedef struct _burst_catcher_t {
     unsigned burst_buf_size;
     unsigned burst_num;
     float burst_rssi;
+    float pre_agc_power_sum;
+    unsigned pre_agc_sample_count;
+    float noise_floor_sum;
+    unsigned noise_floor_count;
     struct timespec timestamp;
 } burst_catcher_t;
 
