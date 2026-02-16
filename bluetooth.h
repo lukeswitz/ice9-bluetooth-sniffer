@@ -10,6 +10,7 @@
 
 void bluetooth_init(void);
 void bluetooth_init_rssi_calibration(const char *sdr_name, int gain, unsigned channels);
+float bluetooth_get_rssi_offset(void);
 void bluetooth_detect(uint8_t *bits, unsigned len, float *demod, unsigned demod_len, unsigned silence_offset, unsigned freq, float rssi, float noise, struct timespec timestamp, uint32_t *lap_out, uint32_t *aa_out);
 
 typedef struct _ble_packet_t {

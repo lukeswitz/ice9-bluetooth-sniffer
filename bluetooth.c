@@ -75,6 +75,10 @@ void bluetooth_set_rssi_offset(float offset_db) {
     rssi_calibration_offset = offset_db;
 }
 
+float bluetooth_get_rssi_offset(void) {
+    return rssi_calibration_offset;
+}
+
 void bluetooth_init_rssi_calibration(const char *sdr_name, int gain, unsigned channels) {
     rssi_calibration_offset = 20.0f * log10f((float)channels);
     fprintf(stderr, "RSSI: compensating for FFT 1/%u scaling = +%.1f dB\n",

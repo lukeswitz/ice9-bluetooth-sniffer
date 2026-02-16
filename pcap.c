@@ -12,6 +12,7 @@
 #include <liquid/liquid.h>
 
 #include "pcap.h"
+#include "bluetooth.h"
 #include "hackrf.h"
 #include "bladerf.h"
 #include "usrp.h"
@@ -42,6 +43,11 @@ extern SoapySDRDevice *soapy_device_global;
 extern void **agc_array_global;
 extern unsigned num_agcs_global;
 extern float sql;
+
+// Track initial gain values for distance calculation compensation
+static unsigned initial_vga_gain = 0;
+static unsigned initial_lna_gain = 0;
+static int initial_gain_captured = 0;
 #endif
 
 struct _pcap_t {
@@ -296,6 +302,21 @@ void *zmq_control_thread(void *arg) {
             continue;
         buf[len] = '\0';
 
+        // Handle "status" command without requiring colon
+        if (strcmp(buf, "status") == 0 || strcmp(buf, "status:") == 0) {
+            // Capture initial gain values on first status request
+            if (!initial_gain_captured) {
+                initial_vga_gain = vga_gain;
+                initial_lna_gain = lna_gain;
+                initial_gain_captured = 1;
+            }
+            float rssi_offset = bluetooth_get_rssi_offset();
+            snprintf(buf, sizeof(buf), "vga=%u lna=%u squelch=%.1f rssi_offset=%.1f vga0=%u lna0=%u",
+                     vga_gain, lna_gain, sql, rssi_offset, initial_vga_gain, initial_lna_gain);
+            zmq_send(zmq_control, buf, strlen(buf), 0);
+            continue;
+        }
+
         char *colon = strchr(buf, ':');
         if (!colon) {
             zmq_send(zmq_control, "ERR invalid_format", 18, 0);
@@ -359,10 +380,6 @@ void *zmq_control_thread(void *arg) {
             } else {
                 zmq_send(zmq_control, "ERR no_agc", 10, 0);
             }
-        } else if (strcmp(cmd, "status") == 0) {
-            snprintf(buf, sizeof(buf), "vga=%u lna=%u squelch=%.1f",
-                     vga_gain, lna_gain, sql);
-            zmq_send(zmq_control, buf, strlen(buf), 0);
         } else {
             zmq_send(zmq_control, "ERR unknown_cmd", 15, 0);
         }

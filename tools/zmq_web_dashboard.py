@@ -766,6 +766,7 @@ class DashboardState:
 
     def get_devices(self):
         """Return device list sorted by last-seen (most recent first)."""
+        global rssi_calibration_offset, initial_vga_gain, initial_lna_gain, current_vga_gain, current_lna_gain
         with self.lock:
             self._dirty = False
             devs = []
@@ -774,10 +775,17 @@ class DashboardState:
                 dd = dict(d)
                 dd["rssi_avg"] = round(d["rssi_sum"] / d["rssi_cnt"]) if d["rssi_cnt"] else d["rssi"]
                 # Distance estimation from TX power + avg RSSI
+                # Note: RSSI values are calibrated, so we need to subtract the offset for distance calc
                 tx = d.get("tx_pwr")
                 if tx is not None and dd["rssi_avg"] < 0:
+                    # Calculate gain delta (current - initial)
+                    gain_delta = (current_vga_gain + current_lna_gain) - (initial_vga_gain + initial_lna_gain)
+
+                    # Subtract calibration offset and gain delta to get raw RSSI for distance formula
+                    # Higher gain = higher measured RSSI, so subtract gain increase
+                    raw_rssi = dd["rssi_avg"] - rssi_calibration_offset - gain_delta
                     measured = tx - 41  # RSSI at 1m for BLE 2.4 GHz
-                    dd["est_dist"] = round(10 ** ((measured - dd["rssi_avg"]) / 20.0), 1)
+                    dd["est_dist"] = round(10 ** ((measured - raw_rssi) / 20.0), 1)
                 else:
                     dd["est_dist"] = None
                 # IRK resolution fields
@@ -1016,6 +1024,11 @@ running = True
 zmq_control_socket = None
 zmq_control_endpoint = None
 zmq_control_lock = threading.Lock()
+rssi_calibration_offset = 0.0  # RSSI calibration offset from SDR
+initial_vga_gain = 0  # Initial VGA gain at startup
+initial_lna_gain = 0  # Initial LNA gain at startup
+current_vga_gain = 0  # Current VGA gain
+current_lna_gain = 0  # Current LNA gain
 
 def init_zmq_control(endpoint):
     global zmq_control_socket, zmq_control_endpoint
@@ -1049,7 +1062,8 @@ def reset_zmq_control():
         zmq_control_socket.connect(zmq_control_endpoint)
 
 def send_sdr_control(cmd, val):
-    global zmq_control_socket
+    global zmq_control_socket, rssi_calibration_offset
+    global initial_vga_gain, initial_lna_gain, current_vga_gain, current_lna_gain
     if not zmq_control_socket:
         return "ERR no_control_socket"
 
@@ -1066,6 +1080,25 @@ def send_sdr_control(cmd, val):
             else:
                 return "ERR unknown_cmd"
             resp = zmq_control_socket.recv_string()
+
+            # Parse status response
+            if cmd == "status" and resp and not resp.startswith("ERR"):
+                try:
+                    for part in resp.split():
+                        if part.startswith("rssi_offset="):
+                            rssi_calibration_offset = float(part.split("=")[1])
+                            print(f"  RSSI calibration offset: {rssi_calibration_offset:.1f} dB", file=sys.stderr)
+                        elif part.startswith("vga0="):
+                            initial_vga_gain = int(part.split("=")[1])
+                        elif part.startswith("lna0="):
+                            initial_lna_gain = int(part.split("=")[1])
+                        elif part.startswith("vga="):
+                            current_vga_gain = int(part.split("=")[1])
+                        elif part.startswith("lna="):
+                            current_lna_gain = int(part.split("=")[1])
+                except Exception:
+                    pass
+
             return resp
         except zmq.Again:
             reset_zmq_control()
@@ -1798,6 +1831,15 @@ def main():
     # Init ZMQ control socket for SDR controls
     control_endpoint = args.endpoints[0].replace(":5555", ":5556")
     init_zmq_control(control_endpoint)
+
+    # Fetch initial status to get RSSI calibration offset
+    time.sleep(0.5)
+    try:
+        send_sdr_control("status", None)
+        if rssi_calibration_offset == 0.0:
+            print(f"  WARNING: RSSI offset not set, distance calculations will be wrong!", file=sys.stderr)
+    except Exception as e:
+        print(f"  Warning: failed to fetch initial status: {e}", file=sys.stderr)
 
     # Start ZMQ receiver thread
     zmq_thread = threading.Thread(
