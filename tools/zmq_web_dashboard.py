@@ -30,8 +30,12 @@ Usage:
     # Update Bluetooth device database (Nordic Semiconductor, MIT licensed):
     python3 zmq_web_dashboard.py tcp://localhost:5555 --update-bt-db
 
+    # RPA resolution with Identity Resolving Keys:
+    python3 zmq_web_dashboard.py tcp://localhost:5555 --irk-file irks.txt
+
 Requirements:
     pip install pyzmq
+    pip install cryptography  (only needed for --irk-file)
 """
 
 import argparse
@@ -54,6 +58,70 @@ try:
 except ImportError:
     print("pyzmq is required: pip install pyzmq", file=sys.stderr)
     sys.exit(1)
+
+# ---------------------------------------------------------------------------
+# IRK / RPA resolution (BT Core Spec Vol 3, Part H, Section 2.2.2)
+# ---------------------------------------------------------------------------
+_irk_list = []  # list of (label, 16-byte key); populated by --irk-file
+
+def _load_irk_file(path):
+    """Load IRKs from file. Returns list of (label, bytes)."""
+    try:
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes  # noqa: F811
+    except ImportError:
+        print("Error: --irk-file requires the 'cryptography' package\n"
+              "       pip install cryptography", file=sys.stderr)
+        sys.exit(1)
+    irks = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if ":" not in line:
+                continue
+            label, hex_key = line.split(":", 1)
+            try:
+                key_bytes = bytes.fromhex(hex_key.strip())
+            except ValueError:
+                print(f"  Warning: skipping IRK '{label}' (bad hex)", file=sys.stderr)
+                continue
+            if len(key_bytes) != 16:
+                print(f"  Warning: skipping IRK '{label}' (not 16 bytes)", file=sys.stderr)
+                continue
+            irks.append((label.strip(), key_bytes))
+    return irks
+
+
+def _bt_ah(irk, prand):
+    """BT ah() function: AES-128-ECB(IRK, 0x00*13 || prand) -> last 3 bytes."""
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    cipher = Cipher(algorithms.AES(irk), modes.ECB())
+    enc = cipher.encryptor()
+    ct = enc.update(b'\x00' * 13 + prand) + enc.finalize()
+    return ct[-3:]
+
+
+def _resolve_rpa(mac_str):
+    """Check MAC against all loaded IRKs. Returns label or None."""
+    if not _irk_list:
+        return None
+    parts = mac_str.replace("-", ":").split(":")
+    if len(parts) != 6:
+        return None
+    try:
+        addr = bytes(int(b, 16) for b in parts)
+    except ValueError:
+        return None
+    if len(addr) != 6 or (addr[0] >> 6) != 0b01:
+        return None  # not an RPA
+    prand = addr[:3]
+    expected = addr[3:]
+    for label, irk in _irk_list:
+        if _bt_ah(irk, prand) == expected:
+            return label
+    return None
+
 
 # ---------------------------------------------------------------------------
 # BLE / PCAP structures (matching pcap.c / zmq_subscriber.py)
@@ -596,12 +664,22 @@ class DashboardState:
             if not crc_ok:
                 return
 
+            # IRK resolution: if this RPA matches a known IRK, use the
+            # identity label as the device key (merging all rotating MACs)
+            identity = None
+            dev_key = mac
+            if _irk_list and pkt.get("mac_type") == "resolvable":
+                label = _resolve_rpa(mac)
+                if label:
+                    identity = label
+                    dev_key = f"[{label}]"
+
             now = round(pkt["timestamp"], 6)
             fp = pkt.get("fingerprint", {})
             rssi = pkt["signal_power"]
 
-            if mac in self.devices:
-                d = self.devices[mac]
+            if dev_key in self.devices:
+                d = self.devices[dev_key]
                 d["pkts"] += 1
                 d["last"] = now
                 d["freq"] = pkt["freq_mhz"]
@@ -634,9 +712,12 @@ class DashboardState:
                 for svc in fp.get("services") or []:
                     if svc not in d["services"]:
                         d["services"].append(svc)
+                # Track resolved RPA addresses
+                if identity and "rpa_addrs" in d:
+                    d["rpa_addrs"].add(mac)
             else:
                 d = {
-                    "mac": mac,
+                    "mac": dev_key,
                     "first": now,
                     "last": now,
                     "freq": pkt["freq_mhz"],
@@ -655,11 +736,15 @@ class DashboardState:
                     "appear": fp.get("appearance") or "",
                     "tx_pwr": fp.get("tx_power"),
                     "services": list(fp.get("services") or []),
+                    "identity": identity,
                 }
+                if identity:
+                    d["rpa_addrs"] = {mac}
+                    d["mac_type"] = "resolved"
                 if gps_info:
                     d["lat"] = round(gps_info[0], 6)
                     d["lon"] = round(gps_info[1], 6)
-                self.devices[mac] = d
+                self.devices[dev_key] = d
             self._dirty = True
 
     def get_stats(self):
@@ -688,6 +773,19 @@ class DashboardState:
                 # Add computed avg RSSI for the JSON output
                 dd = dict(d)
                 dd["rssi_avg"] = round(d["rssi_sum"] / d["rssi_cnt"]) if d["rssi_cnt"] else d["rssi"]
+                # Distance estimation from TX power + avg RSSI
+                tx = d.get("tx_pwr")
+                if tx is not None and dd["rssi_avg"] < 0:
+                    measured = tx - 41  # RSSI at 1m for BLE 2.4 GHz
+                    dd["est_dist"] = round(10 ** ((measured - dd["rssi_avg"]) / 20.0), 1)
+                else:
+                    dd["est_dist"] = None
+                # IRK resolution fields
+                rpa_addrs = d.get("rpa_addrs")
+                dd["identity"] = d.get("identity")
+                dd["rpa_count"] = len(rpa_addrs) if rpa_addrs else 0
+                if rpa_addrs:
+                    del dd["rpa_addrs"]
                 # Don't send internal accumulators
                 del dd["rssi_sum"]
                 del dd["rssi_cnt"]
@@ -823,9 +921,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/csv")
         self.send_header("Content-Disposition", "attachment; filename=ble_devices.csv")
         self.end_headers()
-        cols = ["mac", "mac_type", "mfr", "apple", "name", "appear", "services",
-                "type", "rssi", "rssi_min", "rssi_avg", "tx_pwr", "pkts",
-                "crc_ok", "crc_bad", "freq", "first", "last"]
+        cols = ["mac", "mac_type", "identity", "rpa_count", "mfr", "apple",
+                "name", "appear", "services", "type", "rssi", "rssi_min",
+                "rssi_avg", "tx_pwr", "est_dist", "pkts", "crc_ok",
+                "crc_bad", "freq", "first", "last"]
         self.wfile.write((",".join(cols) + "\n").encode())
         for d in devs:
             row = []
@@ -1092,6 +1191,7 @@ tr.fresh td { background: #1a2a1a; }
         <th data-col="services">services</th>
         <th data-col="type">type</th>
         <th data-col="rssi">rssi</th>
+        <th data-col="est_dist">dist</th>
         <th data-col="pkts" class="count">pkts</th>
         <th data-col="crc">crc %</th>
         <th data-col="first">first seen</th>
@@ -1190,6 +1290,7 @@ function addrCls(t) {
   if (t==='public') return 'red';
   if (t==='static') return 'org';
   if (t==='resolvable') return 'yel';
+  if (t==='resolved') return 'grn';
   return 'dim';
 }
 
@@ -1222,7 +1323,14 @@ function renderDevices() {
     const tr = document.createElement('tr');
     const fresh = (now - d.last) < 3;
     if (fresh) tr.className = 'fresh';
-    const mc = priv ? mask(d.mac) : d.mac;
+    let mc = priv ? mask(d.mac) : d.mac;
+    let macCls = priv ? 'masked' : '';
+    if (d.identity) {
+      mc = priv ? '[hidden]' : d.mac;
+      macCls = 'grn';
+      if (!priv && d.rpa_count > 1) mc += ' ('+d.rpa_count+' addrs)';
+    }
+    const dist = d.est_dist != null ? '~'+d.est_dist+'m' : '';
     const total = d.crc_ok + d.crc_bad;
     const crcPct = total > 0 ? Math.round(100*d.crc_ok/total)+'%' : '-';
     const crcCls = total > 0 ? (d.crc_ok/total > 0.8 ? 'grn' : d.crc_ok/total > 0.4 ? 'yel' : 'red') : 'dim';
@@ -1230,13 +1338,14 @@ function renderDevices() {
     const mt = d.mac_type || '';
     tr.innerHTML =
       `<td class="dim">${ago(d.last)}</td>`+
-      `<td class="${priv?'masked':''}">${mc}</td>`+
+      `<td class="${macCls}">${mc}</td>`+
       `<td class="${addrCls(mt)}">${mt}</td>`+
       `<td>${mfrLabel(d)}</td>`+
       `<td class="blu">${d.name||''}</td>`+
       `<td class="dim">${svcLabel(d)}</td>`+
       `<td class="${isAdv?'blu':'org'}">${d.type}</td>`+
       `<td>${rssiLabel(d)}</td>`+
+      `<td class="dim">${dist}</td>`+
       `<td class="count">${d.pkts.toLocaleString()}</td>`+
       `<td class="${crcCls}">${crcPct}</td>`+
       `<td class="dim">${fmtT(d.first)}</td>`;
@@ -1400,6 +1509,8 @@ def main():
                         help="Bind SUB socket (sensors connect to us) instead of connecting")
     parser.add_argument("--update-bt-db", action="store_true",
                         help="Download/update Bluetooth numbers database from Nordic Semiconductor, then run")
+    parser.add_argument("--irk-file", metavar="FILE",
+                        help="File of IRKs for RPA resolution (format: label:hex per line)")
     args = parser.parse_args()
 
     # Update Bluetooth numbers database if requested
@@ -1409,6 +1520,15 @@ def main():
 
     # Load cached Bluetooth numbers (merges over hardcoded fallbacks)
     bt_db_load()
+
+    # Load IRKs for RPA resolution
+    global _irk_list
+    if args.irk_file:
+        _irk_list = _load_irk_file(args.irk_file)
+        if _irk_list:
+            print(f"  Loaded {len(_irk_list)} IRK(s) for RPA resolution", file=sys.stderr)
+        else:
+            print("  Warning: no valid IRKs found in file", file=sys.stderr)
 
     gps_enabled = args.gps
 
@@ -1447,6 +1567,9 @@ def main():
         dlt_name = "DLT 192 (PPI+GPS)" if args.gps else "DLT 256 (BLE)"
         print(f"  PCAP file:  {args.write} ({dlt_name})", file=sys.stderr)
     print(f"  Privacy:    MAC addresses hidden by default", file=sys.stderr)
+    if _irk_list:
+        print(f"  IRK file:   {args.irk_file} ({len(_irk_list)} key(s))", file=sys.stderr)
+    print(f"  Distance:   estimated from TX power + RSSI (free space)", file=sys.stderr)
     print(f"  {'='*40}\n", file=sys.stderr)
 
     try:

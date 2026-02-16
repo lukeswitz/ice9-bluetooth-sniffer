@@ -7,6 +7,8 @@ This document describes improvements made to ice9-bluetooth-sniffer:
 1. Optional CRC-24 validation with Wireshark integration
 2. Access Address correlator for dramatically improved packet detection
 3. OpenCL GPU acceleration for the polyphase channelizer + FFT
+4. Distance estimation from TX Power Level + RSSI
+5. IRK-based RPA resolution for tracking devices with rotating MACs
 
 ## Changes Made
 
@@ -230,7 +232,85 @@ All changes are fully backward compatible:
 - Original behavior preserved for existing workflows
 - No breaking changes to command-line interface
 
+### 4. Distance Estimation from TX Power + RSSI
+
+**Problem:**
+The dashboard shows RSSI but provides no intuitive sense of how far away
+a device is.
+
+**Solution:**
+Implemented distance estimation using the log-distance path loss model
+for BLE at 2.4 GHz. For any device advertising TX Power Level (AD type
+0x0A, defined in CSS Part A, Section 1.5), the dashboard computes:
+
+```
+measured = tx_power - 41       (estimated RSSI at 1 meter for BLE 2.4 GHz)
+distance = 10 ^ ((measured - rssi_avg) / 20)    (free space, n=2.0)
+```
+
+- Shows as a "dist" column in the device table (e.g. `~1.4m`)
+- Included in CSV export (`est_dist` column) and SSE/JSON API
+- Only shown when TX Power Level is advertised; blank otherwise
+- Uses averaged RSSI for stability
+
+**Limitations:** Free-space path loss (n=2.0) is optimistic indoors.
+Real-world distances will be longer due to walls, reflections, and
+body absorption. The estimate is useful for relative comparison
+(closer vs farther) rather than precise ranging.
+
+**Live Testing Results (USRP B210, 60 channels):**
+95 out of 473 detected devices advertised TX Power Level and received
+distance estimates. Nearby devices (phones, laptops on the same desk)
+showed 0.2-1.5m, consistent with the test environment.
+
+### 5. IRK-Based RPA Resolution
+
+**Problem:**
+BLE devices using Resolvable Private Addresses (RPAs) rotate their MAC
+address periodically (typically every 15 minutes). Each rotation creates
+a new device entry in the dashboard, fragmenting the view and inflating
+device counts.
+
+**Solution:**
+Implemented the BT Core Spec `ah()` function (Vol 3, Part H, Section
+2.2.2) to resolve RPAs against known Identity Resolving Keys (IRKs).
+When `--irk-file` is provided, the dashboard checks each incoming RPA
+against all loaded IRKs. Matching addresses are merged into a single
+device entry keyed by the identity label.
+
+The `ah()` function: `AES-128-ECB(IRK, 0x00*13 || prand)`, taking the
+last 3 bytes of the ciphertext as the hash. An RPA is verified by
+splitting the 6-byte address into `prand` (bytes 0-2, top 2 bits = 01)
+and `hash` (bytes 3-5), then checking if `ah(IRK, prand) == hash`.
+
+**IRK file format** (one per line):
+```
+my-phone:ec0234a357c8ad05341010a60a397d9b
+work-laptop:aabbccddeeff00112233445566778899
+```
+
+On Linux, IRKs for paired devices are in
+`/var/lib/bluetooth/<adapter>/<device>/info` under `[IdentityResolvingKey]`.
+
+**Dashboard behavior:**
+- Resolved devices show with identity label instead of MAC (e.g. `[my-phone]`)
+- Highlighted green to distinguish from unresolved RPAs (yellow)
+- Address rotation count displayed (e.g. `(3 addrs)`)
+- All packet counts, RSSI, and timestamps merge into a single entry
+- Included in CSV export (`identity`, `rpa_count` columns)
+
+**Dependencies:** Requires the `cryptography` Python package, but only
+when `--irk-file` is actually used. No new dependencies otherwise.
+
+**Usage:**
+```bash
+python3 tools/zmq_web_dashboard.py tcp://localhost:5555 --irk-file irks.txt
+```
+
 ## References
 
 - Bluetooth Core Specification Volume 6, Part B, Section 3.1.1 (CRC)
+- Bluetooth Core Specification Volume 3, Part H, Section 2.2.2 (RPA resolution, `ah()` function)
+- Bluetooth Core Specification Supplement, Part A, Section 1.5 (TX Power Level AD type)
+- Log-distance path loss model (free space, n=2.0) for 2.4 GHz BLE
 - PCAP DLT_BLUETOOTH_LE_LL_WITH_PHDR format specification
