@@ -13,6 +13,11 @@
 
 #include "pcap.h"
 #include "hackrf.h"
+#include "bladerf.h"
+#include "usrp.h"
+#ifdef HAVE_SOAPYSDR
+#include "soapysdr.h"
+#endif
 #include "burst_catcher.h"
 
 #ifdef HAVE_GPS
@@ -29,6 +34,11 @@ static void *zmq_pub = NULL;
 static void *zmq_control = NULL;
 extern sig_atomic_t running;
 extern hackrf_device *hackrf_device_global;
+extern struct bladerf *bladerf_device_global;
+extern uhd_usrp_handle usrp_device_global;
+#ifdef HAVE_SOAPYSDR
+extern SoapySDRDevice *soapy_device_global;
+#endif
 extern void **agc_array_global;
 extern unsigned num_agcs_global;
 extern float sql;
@@ -296,32 +306,44 @@ void *zmq_control_thread(void *arg) {
         char *cmd = buf;
         char *val = colon + 1;
 
-        if (strcmp(cmd, "vga") == 0) {
+        if (strcmp(cmd, "vga") == 0 || strcmp(cmd, "gain") == 0) {
             int v = atoi(val);
-            // VGA: 0-62 in steps of 2 dB
-            v = (v / 2) * 2;
-            if (v < 0) v = 0;
-            if (v > 62) v = 62;
             if (hackrf_device_global) {
+                // HackRF VGA: 0-62 in steps of 2 dB
+                v = (v / 2) * 2;
+                if (v < 0) v = 0;
+                if (v > 62) v = 62;
                 hackrf_set_gains(hackrf_device_global, v, lna_gain);
                 zmq_send(zmq_control, "OK", 2, 0);
+            } else if (bladerf_device_global) {
+                bladerf_set_rx_gain(bladerf_device_global, v);
+                zmq_send(zmq_control, "OK", 2, 0);
+            } else if (usrp_device_global) {
+                usrp_set_gain(usrp_device_global, (float)v);
+                zmq_send(zmq_control, "OK", 2, 0);
+#ifdef HAVE_SOAPYSDR
+            } else if (soapy_device_global) {
+                soapy_set_gain(soapy_device_global, (double)v);
+                zmq_send(zmq_control, "OK", 2, 0);
+#endif
             } else {
                 zmq_send(zmq_control, "ERR no_device", 13, 0);
             }
         } else if (strcmp(cmd, "lna") == 0) {
             int v = atoi(val);
-            // LNA: only 0, 8, 16, 24, 32, or 40 dB
-            if (v <= 4) v = 0;
-            else if (v <= 12) v = 8;
-            else if (v <= 20) v = 16;
-            else if (v <= 28) v = 24;
-            else if (v <= 36) v = 32;
-            else v = 40;
             if (hackrf_device_global) {
+                // HackRF LNA: only 0, 8, 16, 24, 32, or 40 dB
+                if (v <= 4) v = 0;
+                else if (v <= 12) v = 8;
+                else if (v <= 20) v = 16;
+                else if (v <= 28) v = 24;
+                else if (v <= 36) v = 32;
+                else v = 40;
                 hackrf_set_gains(hackrf_device_global, vga_gain, v);
                 zmq_send(zmq_control, "OK", 2, 0);
             } else {
-                zmq_send(zmq_control, "ERR no_device", 13, 0);
+                // Other SDRs don't have separate LNA, ignore
+                zmq_send(zmq_control, "OK", 2, 0);
             }
         } else if (strcmp(cmd, "squelch") == 0) {
             float v = atof(val);

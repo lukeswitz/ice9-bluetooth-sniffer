@@ -14,7 +14,7 @@
 
 #include "sdr.h"
 
-const double soapy_gain_val = 40.0;
+double soapy_gain_val = 40.0;
 
 extern sig_atomic_t running;
 extern pid_t self_pid;
@@ -225,4 +225,12 @@ void *soapy_stream_thread(void *arg) {
 
 void soapy_close(SoapySDRDevice *device) {
     SoapySDRDevice_unmake(device);
+}
+
+void soapy_set_gain(SoapySDRDevice *dev, double gain) {
+    soapy_gain_val = gain;
+    if (dev) {
+        if (SoapySDRDevice_setGain(dev, SOAPY_SDR_RX, 0, gain) != 0)
+            fprintf(stderr, "Warning: Unable to set SoapySDR gain\n");
+    }
 }

@@ -86,6 +86,9 @@ int gpsd_active = 0;
 
 #ifdef HAVE_ZMQ
 hackrf_device *hackrf_device_global = NULL;
+struct bladerf *bladerf_device_global = NULL;
+uhd_usrp_handle usrp_device_global = NULL;
+SoapySDRDevice *soapy_device_global = NULL;
 void **agc_array_global = NULL;
 unsigned num_agcs_global = 0;
 #endif
@@ -677,6 +680,11 @@ int main(int argc, char **argv) {
 
 #ifdef HAVE_ZMQ
         hackrf_device_global = hackrf;
+        bladerf_device_global = bladerf;
+        usrp_device_global = usrp;
+#ifdef HAVE_SOAPYSDR
+        soapy_device_global = soapy;
+#endif
 #endif
     }
     gen_syndrome_map(1);

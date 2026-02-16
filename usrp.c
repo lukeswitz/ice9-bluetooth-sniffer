@@ -17,7 +17,7 @@ extern unsigned channels;
 extern float samp_rate;
 extern unsigned center_freq;
 
-const float usrp_gain_val = 60;
+float usrp_gain_val = 60;
 
 #define KVLEN 16
 typedef struct _kv_pair_t {
@@ -209,4 +209,13 @@ void *usrp_stream_thread(void *arg) {
 
 void usrp_close(uhd_usrp_handle usrp) {
     uhd_usrp_free(&usrp);
+}
+
+void usrp_set_gain(uhd_usrp_handle usrp, float gain) {
+    usrp_gain_val = gain;
+    if (usrp) {
+        uhd_error error = uhd_usrp_set_rx_gain(usrp, gain, 0, "");
+        if (error != UHD_ERROR_NONE)
+            fprintf(stderr, "Warning: Unable to set USRP gain: %u\n", error);
+    }
 }
