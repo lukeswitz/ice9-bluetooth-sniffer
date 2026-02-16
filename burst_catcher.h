@@ -39,5 +39,8 @@ void burst_catcher_create(burst_catcher_t *c, unsigned freq);
 void burst_catcher_destroy(burst_catcher_t *c);
 int burst_catcher_execute(burst_catcher_t *c, float complex *sample, burst_t *burst_out);
 void burst_destroy(burst_t *b);
+void burst_catcher_set_squelch(burst_catcher_t *c, float squelch_db);
+
+extern float sql;
 
 #endif

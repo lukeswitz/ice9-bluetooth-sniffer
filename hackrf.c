@@ -11,8 +11,8 @@
 
 #include "sdr.h"
 
-const unsigned vga_gain = 32;
-const unsigned lna_gain = 32;
+unsigned vga_gain = 32;
+unsigned lna_gain = 32;
 
 extern float samp_rate;
 extern unsigned center_freq;
@@ -71,4 +71,11 @@ int hackrf_rx_cb(hackrf_transfer *t) {
     else
         free(s);
     return 0;
+}
+
+void hackrf_set_gains(hackrf_device *dev, unsigned vga, unsigned lna) {
+    vga_gain = vga > 62 ? 62 : vga;
+    lna_gain = lna > 40 ? 40 : lna;
+    hackrf_set_vga_gain(dev, vga_gain);
+    hackrf_set_lna_gain(dev, lna_gain);
 }

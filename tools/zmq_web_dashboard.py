@@ -992,11 +992,87 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if path == "/api/control":
+            content_length = int(self.headers['Content-Length'])
+            body = self.rfile.read(content_length).decode()
+            try:
+                req = json.loads(body)
+                cmd = req.get("cmd")
+                val = req.get("val")
+                result = send_sdr_control(cmd, val)
+                self._serve_json({"status": "ok", "result": result})
+            except Exception as e:
+                self._serve_json({"status": "error", "message": str(e)})
+        else:
+            self.send_error(404)
+
 
 # ---------------------------------------------------------------------------
 # ZMQ receiver thread
 # ---------------------------------------------------------------------------
 running = True
+zmq_control_socket = None
+zmq_control_endpoint = None
+zmq_control_lock = threading.Lock()
+
+def init_zmq_control(endpoint):
+    global zmq_control_socket, zmq_control_endpoint
+    zmq_control_endpoint = endpoint
+    try:
+        ctx = zmq.Context()
+        zmq_control_socket = ctx.socket(zmq.REQ)
+        zmq_control_socket.setsockopt(zmq.RCVTIMEO, 2000)
+        zmq_control_socket.setsockopt(zmq.SNDTIMEO, 2000)
+        zmq_control_socket.setsockopt(zmq.LINGER, 0)
+        zmq_control_socket.connect(endpoint)
+        print(f"  ZMQ Control: {endpoint}", file=sys.stderr)
+    except Exception as e:
+        print(f"  ZMQ Control: failed to connect ({e})", file=sys.stderr)
+        zmq_control_socket = None
+
+def reset_zmq_control():
+    """Reset control socket on error - REQ sockets have strict state machine"""
+    global zmq_control_socket
+    if zmq_control_socket:
+        try:
+            zmq_control_socket.close()
+        except:
+            pass
+    if zmq_control_endpoint:
+        ctx = zmq.Context()
+        zmq_control_socket = ctx.socket(zmq.REQ)
+        zmq_control_socket.setsockopt(zmq.RCVTIMEO, 2000)
+        zmq_control_socket.setsockopt(zmq.SNDTIMEO, 2000)
+        zmq_control_socket.setsockopt(zmq.LINGER, 0)
+        zmq_control_socket.connect(zmq_control_endpoint)
+
+def send_sdr_control(cmd, val):
+    global zmq_control_socket
+    if not zmq_control_socket:
+        return "ERR no_control_socket"
+
+    with zmq_control_lock:
+        try:
+            if cmd == "vga":
+                zmq_control_socket.send_string(f"vga:{int(val)}", zmq.DONTWAIT)
+            elif cmd == "lna":
+                zmq_control_socket.send_string(f"lna:{int(val)}", zmq.DONTWAIT)
+            elif cmd == "squelch":
+                zmq_control_socket.send_string(f"squelch:{float(val)}", zmq.DONTWAIT)
+            elif cmd == "status":
+                zmq_control_socket.send_string("status", zmq.DONTWAIT)
+            else:
+                return "ERR unknown_cmd"
+            resp = zmq_control_socket.recv_string()
+            return resp
+        except zmq.Again:
+            reset_zmq_control()
+            return "ERR timeout"
+        except Exception as e:
+            reset_zmq_control()
+            return f"ERR {str(e)}"
 
 
 def zmq_receiver(endpoints, server_key_path, pcap_file, use_gps, bind_mode=False):
@@ -1183,6 +1259,7 @@ td[data-col="rssi"] { font-family: 'Menlo', 'Monaco', 'Courier New', monospace; 
   <div class="tabs" id="tabBar">
     <div class="tab active" data-tab="devices" onclick="switchTab('devices')">devices</div>
     <div class="tab" data-tab="summary" onclick="switchTab('summary')">summary</div>
+    <div class="tab" data-tab="sdr" onclick="switchTab('sdr')">sdr</div>
   </div>
   <span class="spacer"></span>
   <button onclick="location.href='/api/export.csv'">export CSV</button>
@@ -1237,6 +1314,47 @@ td[data-col="rssi"] { font-family: 'Menlo', 'Monaco', 'Courier New', monospace; 
   <div id="map"></div>
 </div>
 
+<div class="panel" id="panelSdr">
+  <div style="padding:20px;max-width:600px;">
+    <h3 style="margin-bottom:12px;color:#ccc;">SDR Controls</h3>
+
+    <div style="margin-bottom:20px;padding:12px;background:#202020;border:1px solid #333;">
+      <div style="margin-bottom:8px;color:#888;font-size:11px;">Quick Presets:</div>
+      <div style="display:flex;gap:8px;">
+        <button onclick="applyPreset('close')" style="flex:1;">Close Range</button>
+        <button onclick="applyPreset('medium')" style="flex:1;">Medium Range</button>
+        <button onclick="applyPreset('long')" style="flex:1;">Long Range</button>
+      </div>
+      <div style="margin-top:6px;font-size:9px;color:#666;">
+        Close: 0-2m, low noise • Medium: 2-5m, balanced • Long: 5-10m+, high sensitivity
+      </div>
+    </div>
+
+    <div style="margin-bottom:16px;">
+      <label style="display:block;margin-bottom:4px;">VGA Gain: <span id="vgaVal">32</span> dB</label>
+      <input type="range" id="vgaSlider" min="0" max="62" step="2" value="32" style="width:100%;" oninput="updateSDR('vga',this.value)">
+      <div style="font-size:9px;color:#666;margin-top:2px;">Range: 0-62 dB in 2 dB steps</div>
+    </div>
+    <div style="margin-bottom:16px;">
+      <label style="display:block;margin-bottom:4px;">LNA Gain: <span id="lnaVal">32</span> dB</label>
+      <select id="lnaSelect" style="width:100%;background:#333;color:#ccc;border:1px solid #555;padding:4px;font:11px monospace;" onchange="updateSDR('lna',this.value)">
+        <option value="0">0 dB</option>
+        <option value="8">8 dB</option>
+        <option value="16">16 dB</option>
+        <option value="24">24 dB</option>
+        <option value="32" selected>32 dB</option>
+        <option value="40">40 dB</option>
+      </select>
+      <div style="font-size:9px;color:#666;margin-top:2px;">HackRF supports only these 6 values</div>
+    </div>
+    <div style="margin-bottom:16px;">
+      <label style="display:block;margin-bottom:4px;">Squelch: <span id="squelchVal">-45</span> dB</label>
+      <input type="range" id="squelchSlider" min="-70" max="-30" value="-45" style="width:100%;" oninput="updateSDR('squelch',this.value)">
+    </div>
+    <div id="sdrStatus" style="margin-top:12px;color:#888;font-size:11px;"></div>
+  </div>
+</div>
+
 <script>
 let priv = true, map = null, marker = null, trail = [], curTab = 'devices';
 let sortCol = 'last', sortAsc = false;
@@ -1260,6 +1378,83 @@ function togglePrivacy() {
   b.classList.toggle('on', priv);
   renderDevices();
   if (summary) renderSummary(summary);
+}
+
+let sdrTimeout = null;
+let sdrPending = false;
+
+function applyPreset(preset) {
+  let vga, lna, squelch;
+  if (preset === 'close') {
+    vga = 20; lna = 16; squelch = -40;
+  } else if (preset === 'medium') {
+    vga = 32; lna = 32; squelch = -45;
+  } else if (preset === 'long') {
+    vga = 48; lna = 40; squelch = -55;
+  }
+
+  // Update UI controls
+  document.getElementById('vgaSlider').value = vga;
+  document.getElementById('vgaVal').textContent = vga;
+  document.getElementById('lnaSelect').value = lna;
+  document.getElementById('lnaVal').textContent = lna;
+  document.getElementById('squelchSlider').value = squelch;
+  document.getElementById('squelchVal').textContent = squelch;
+
+  // Send all three commands
+  document.getElementById('sdrStatus').textContent = 'applying preset...';
+  Promise.all([
+    fetch('/api/control', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({cmd: 'vga', val: vga})
+    }).then(r => r.json()),
+    fetch('/api/control', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({cmd: 'lna', val: lna})
+    }).then(r => r.json()),
+    fetch('/api/control', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({cmd: 'squelch', val: squelch})
+    }).then(r => r.json())
+  ])
+  .then(results => {
+    const allOk = results.every(d => d.result === 'OK' || d.result === undefined);
+    document.getElementById('sdrStatus').textContent = allOk ? 'Preset applied' : 'Preset applied (some warnings)';
+  })
+  .catch(e => {
+    document.getElementById('sdrStatus').textContent = 'Error: ' + e;
+  });
+}
+
+function updateSDR(cmd, val) {
+  document.getElementById(cmd+'Val').textContent = val;
+
+  // Debounce: wait 300ms after last slider movement
+  if (sdrTimeout) clearTimeout(sdrTimeout);
+
+  sdrTimeout = setTimeout(() => {
+    if (sdrPending) return;  // Skip if previous request still pending
+    sdrPending = true;
+    document.getElementById('sdrStatus').textContent = 'updating...';
+
+    fetch('/api/control', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({cmd, val})
+    })
+    .then(r => r.json())
+    .then(data => {
+      document.getElementById('sdrStatus').textContent = data.result || 'OK';
+      sdrPending = false;
+    })
+    .catch(e => {
+      document.getElementById('sdrStatus').textContent = 'Error: ' + e;
+      sdrPending = false;
+    });
+  }, 300);
 }
 
 function mask(m) { return m ? 'xx:xx:xx:xx:xx:xx' : ''; }
@@ -1599,6 +1794,10 @@ def main():
             snaplen += PPI_GPS_SIZE
         pcap_file.write(PCAP_GLOBAL_HDR.pack(0xA1B2C3D4, 2, 4, 0, 0, snaplen, dlt))
         pcap_file.flush()
+
+    # Init ZMQ control socket for SDR controls
+    control_endpoint = args.endpoints[0].replace(":5555", ":5556")
+    init_zmq_control(control_endpoint)
 
     # Start ZMQ receiver thread
     zmq_thread = threading.Thread(

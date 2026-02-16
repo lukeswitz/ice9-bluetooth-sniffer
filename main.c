@@ -84,6 +84,12 @@ char *zmq_curve_keyfile = NULL;
 int gpsd_active = 0;
 #endif
 
+#ifdef HAVE_ZMQ
+hackrf_device *hackrf_device_global = NULL;
+void **agc_array_global = NULL;
+unsigned num_agcs_global = 0;
+#endif
+
 unsigned long crc_total = 0;
 unsigned long crc_valid_count = 0;
 unsigned long crc_invalid_count = 0;
@@ -668,6 +674,10 @@ int main(int argc, char **argv) {
 #endif
         else
             hackrf = hackrf_setup();
+
+#ifdef HAVE_ZMQ
+        hackrf_device_global = hackrf;
+#endif
     }
     gen_syndrome_map(1);
     bluetooth_init();
@@ -710,6 +720,21 @@ int main(int argc, char **argv) {
     }
     for (i = first_live; i <= last_live; ++i)
         burst_catcher_create(&catcher[i], 2402 + i * 2);
+
+#ifdef HAVE_ZMQ
+    agc_array_global = (void **)catcher;
+    num_agcs_global = 40;
+
+    // Start ZMQ control socket for live SDR adjustments
+    if (zmq_pub_active) {
+        if (zmq_control_init("tcp://*:5556") == 0) {
+            pthread_t control_tid;
+            pthread_create(&control_tid, NULL, zmq_control_thread, NULL);
+            pthread_detach(control_tid);
+            fprintf(stderr, "ZMQ Control: tcp://*:5556\n");
+        }
+    }
+#endif
 
     init_threads(!live);
 
