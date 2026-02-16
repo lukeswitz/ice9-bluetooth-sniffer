@@ -275,6 +275,13 @@ summaries.
 - **CRC-gated device tracking**: when `--check-crc` is enabled on the sniffer,
   only CRC-valid packets create device entries -- eliminates phantom devices
   from corrupted packets. Backward compatible when CRC checking is off.
+- **Distance estimation**: estimates range from TX power + RSSI using a
+  log-distance path loss model. Shows automatically for any device advertising
+  TX Power Level (AD type 0x0A).
+- **RPA resolution**: `--irk-file` merges rotating BLE Resolvable Private
+  Addresses into a single device entry when the Identity Resolving Key is
+  known. Uses the BT Core Spec `ah()` function (AES-128-ECB). Resolved
+  devices are highlighted green with a count of observed MAC rotations.
 - **Summary tab**: breakdowns by manufacturer, MAC address type, PDU type,
   and GATT services; top talkers list; channel activity heatmap
 - **Privacy mode**: MAC addresses masked by default (toggle in UI)
@@ -295,6 +302,7 @@ python3 tools/zmq_web_dashboard.py [endpoints...] [options]
   --server-key FILE         Server public key for CURVE encryption
   --bind                    Bind SUB socket instead of connecting
   --update-bt-db            Download/refresh Bluetooth numbers database
+  --irk-file FILE           File of IRKs for RPA resolution (label:hex per line)
 ```
 
 **Examples:**
@@ -308,6 +316,9 @@ python3 tools/zmq_web_dashboard.py [endpoints...] [options]
 
     # Update Bluetooth device database (downloads latest from Nordic Semiconductor):
     python3 tools/zmq_web_dashboard.py tcp://localhost:5555 --update-bt-db
+
+    # RPA resolution with Identity Resolving Keys:
+    python3 tools/zmq_web_dashboard.py tcp://localhost:5555 --irk-file irks.txt
 
 **Bluetooth Numbers Database:**
 
