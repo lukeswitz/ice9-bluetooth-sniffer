@@ -104,14 +104,32 @@ VkFFTResult init_fft(fft_t *f, unsigned width, unsigned batch_size, MTL::Device 
 
 static bool compile_pfb_kernel(MTL::Device *device) {
     NS::Error *error = nullptr;
+    MTL::Library *lib = nullptr;
 
-    /* load Metal library from the compiled metallib file */
-    NS::String *lib_path = NS::String::string("default.metallib", NS::UTF8StringEncoding);
-    MTL::Library *lib = device->newLibrary(lib_path, &error);
-    if (!lib || error) {
+    /* Try loading Metal library from multiple locations */
+    const char *search_paths[] = {
+        "default.metallib",                      /* current directory (dev) */
+        "/usr/local/bin/default.metallib",       /* installed location */
+        "build/default.metallib",                /* build directory */
+        NULL
+    };
+
+    for (int i = 0; search_paths[i] != NULL && lib == nullptr; i++) {
+        NS::String *lib_path = NS::String::string(search_paths[i], NS::UTF8StringEncoding);
+        error = nullptr;
+        lib = device->newLibrary(lib_path, &error);
+        if (lib) {
+            fprintf(stderr, "Metal: Loaded library from %s\n", search_paths[i]);
+            break;
+        }
+    }
+
+    if (!lib) {
         if (error) {
             NS::String *desc = error->localizedDescription();
             fprintf(stderr, "Metal: Failed to load library: %s\n", desc->utf8String());
+        } else {
+            fprintf(stderr, "Metal: Failed to load library from any search path\n");
         }
         return false;
     }
