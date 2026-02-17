@@ -36,6 +36,18 @@ Optional ZeroMQ for network packet streaming:
 
     sudo apt install libzmq3-dev
 
+Optional GPS tagging (requires gpsd running):
+
+    sudo apt install libgps-dev
+
+**Web dashboard** (`tools/zmq_web_dashboard.py`) requires `pyzmq`:
+
+    pip install pyzmq
+
+Optional RPA resolution (`--irk-file`) requires `cryptography`:
+
+    pip install cryptography
+
 On macOS, fftw3 is not required and [Homebrew](https://brew.sh/) is the
 recommended package manager:
 
@@ -81,7 +93,9 @@ Optional:
     -s, --stats             Print performance stats periodically
     -v, --verbose           Print detailed info about captured bursts
     -I, --install           Install into Wireshark extcap folder
-    -Z, --zmq-pub=ENDPOINT  Publish packets via ZMQ PUB socket
+    -G, --gpsd              Tag packets with GPS coordinates from gpsd
+    -Z, --zmq-pub=ENDPOINT  Publish packets via ZMQ PUB bind socket
+    -X, --zmq-connect=ENDPOINT  Publish via ZMQ PUB connect (collector mode)
     -K, --zmq-curve-key=FILE  Enable CURVE encryption (requires key file)
         --sensor-id=NAME      Sensor identity for multi-sensor deployments
 ```
@@ -388,7 +402,7 @@ Information) header format, compatible with Wireshark and Kismet.
     sudo gpsd /dev/ttyUSB0 -F /var/run/gpsd.sock
 
     # Capture with GPS tagging:
-    ice9-bluetooth -l -c 2441 -C 40 --zmq-pub tcp://*:5555 --check-crc
+    ice9-bluetooth -l -c 2441 -C 40 --gpsd --zmq-pub tcp://*:5555 --check-crc
 
     # Dashboard with GPS map:
     python3 tools/zmq_web_dashboard.py tcp://localhost:5555 --gps

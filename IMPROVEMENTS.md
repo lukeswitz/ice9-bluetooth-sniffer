@@ -214,8 +214,7 @@ due to collisions and multipath, but the channelizer maintains 100%
 realtime with zero drops. The GPU has substantial headroom even under
 heavy load.
 
-## Files Modified
-
+**Files modified (sections 1-3):**
 - **bluetooth.c**: CRC-24 algorithm, CRC validation logic, AA correlator
 - **bluetooth.h**: Added `bluetooth_init()` declaration, CRC fields to `ble_packet_t`, updated `bluetooth_detect()` signature
 - **main.c**: Added `bluetooth_init()` call, CRC statistics globals, pass demod signal to detector, GPU channelizer thread
@@ -227,14 +226,9 @@ heavy load.
 - **window.h**: Added `window_dotprod_init()` declaration
 - **CMakeLists.txt**: OpenCL auto-detection and build integration
 
-## Backward Compatibility
-
-All changes are fully backward compatible:
-
-- CRC validation is OFF by default (requires `--check-crc` flag)
-- PCAP format unchanged when CRC checking disabled
-- Original behavior preserved for existing workflows
-- No breaking changes to command-line interface
+**Backward compatibility:** All changes are fully backward compatible.
+CRC validation is OFF by default (requires `--check-crc` flag). PCAP format
+unchanged when CRC checking is disabled. No breaking changes to the CLI.
 
 ### 4. Distance Estimation from TX Power + RSSI
 
@@ -249,8 +243,11 @@ for BLE at 2.4 GHz. For any device advertising TX Power Level (AD type
 
 ```
 measured = tx_power - 41       (estimated RSSI at 1 meter for BLE 2.4 GHz)
-distance = 10 ^ ((measured - rssi_avg) / 20)    (free space, n=2.0)
+distance = 10 ^ ((measured - rssi_avg) / (10 * n))    (default n=2.0, free space)
 ```
+
+The path loss exponent `n` defaults to 2.0 (free space) and can be adjusted
+via `--path-loss-exp` on the dashboard (typical indoor: 2.5-3.5).
 
 - Shows as a "dist" column in the device table (e.g. `~1.4m`)
 - Included in CSV export (`est_dist` column) and SSE/JSON API
