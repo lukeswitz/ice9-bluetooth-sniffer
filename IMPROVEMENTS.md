@@ -9,6 +9,10 @@ This document describes improvements made to ice9-bluetooth-sniffer:
 3. OpenCL GPU acceleration for the polyphase channelizer + FFT
 4. Distance estimation from TX Power Level + RSSI
 5. IRK-based RPA resolution for tracking devices with rotating MACs
+6. Multi-sensor multilateration for BLE device position estimation
+7. Classic Bluetooth (BR/EDR) detection pipeline with UAP estimation
+8. SQLite device database for cross-session persistence
+9. Device alerting (new-device, watch file, commands, webhooks)
 
 ## Changes Made
 
@@ -307,10 +311,231 @@ when `--irk-file` is actually used. No new dependencies otherwise.
 python3 tools/zmq_web_dashboard.py tcp://localhost:5555 --irk-file irks.txt
 ```
 
+### 6. Multi-Sensor Multilateration
+
+**Problem:**
+The dashboard already supports multiple ZMQ sensor endpoints, but treats
+them as interchangeable packet sources. There is no way to determine
+*where* a BLE device is located, even when multiple sensors with known
+GPS positions observe the same device at different signal strengths.
+
+**Solution:**
+Implemented sensor identification, per-sensor RSSI tracking, and
+multilateration (position estimation from distance circles).
+
+**Sniffer side (`--sensor-id`):**
+- New `--sensor-id NAME` flag sets the sensor identity string
+- Defaults to hostname if not specified
+- Sensor ID is prepended as the first ZMQ frame in every message
+- Backward compatible: old subscribers that read the last frame still work
+
+**Dashboard side:**
+- Frame parser handles all 4 ZMQ frame formats (legacy 1-frame, legacy
+  2-frame GPS, new 2-frame with sensor ID, new 3-frame with both)
+- Per-endpoint SUB sockets with `zmq.Poller` in connect mode, so the
+  dashboard knows which endpoint each packet came from
+- Per-sensor state tracking: GPS position, packet count, last seen
+- Per-device-per-sensor RSSI tracking for distance estimation
+- New `/api/sensors` endpoint returns sensor positions and stats
+
+**Multilateration algorithm:**
+- Per-sensor distance from RSSI: `d = 10^((tx_power - 41 - rssi) / (10*n))`
+  where n is the path loss exponent (default 2.0 for free space)
+- Weight: `min(packet_count, 100) / 100` (more observations = more reliable)
+- 2+ sensors: Gauss-Newton iterative weighted least squares in local
+  meter coordinates (lat/lon converted to meters from centroid, solve,
+  convert back)
+- Uncertainty: weighted RMS of distance residuals (meters)
+- Only computed for devices advertising TX Power Level (AD type 0x0A)
+
+**Map visualization (Leaflet.js):**
+- Sensor markers: orange labeled pins at each sensor's GPS position
+- Device markers: colored circles at estimated position
+  - Green: 3+ sensors (best confidence)
+  - Yellow: 2 sensors
+- Dashed uncertainty circles showing estimated error radius
+- Tooltips with device name/MAC, distance, and sensor count
+- Stale entries removed automatically
+
+**New dashboard CLI args:**
+- `--sensor-pos LABEL:LAT,LON` (repeatable) -- static position for
+  sensors without GPS
+- `--path-loss-exp N` (default 2.0) -- path loss exponent for distance
+  estimation. Free space = 2.0, typical indoor = 2.5-3.5
+
+**Synthetic test results:**
+- 3 sensors in equilateral triangle, device at center: 0m error
+- 2 sensors, device between them: ~26m error (expected with only 2 circles)
+- 1 sensor: no position estimate (requires minimum 2)
+
+**Performance:**
+- C side: one additional small `zmq_send()` per packet (sensor ID frame)
+- Dashboard: per-packet dict lookup for sensor RSSI tracking
+- Multilateration math runs once per second in the SSE path, only for
+  devices with TX Power seen by 2+ sensors
+- No measurable throughput impact
+
+**Usage:**
+```bash
+# Sensor 1 (has GPS):
+ice9-bluetooth -l -c 2441 -C 60 --zmq-pub tcp://*:5555 --check-crc --sensor-id roof
+
+# Sensor 2 (no GPS, static position):
+ice9-bluetooth -l -c 2441 -C 60 --zmq-pub tcp://*:5556 --check-crc --sensor-id lobby
+
+# Dashboard with multilateration:
+python3 tools/zmq_web_dashboard.py tcp://sensor1:5555 tcp://sensor2:5556 \
+    --gps --sensor-pos lobby:37.7751,-122.4190
+```
+
+## Files Modified (Multilateration)
+
+- **options.c**: Added `--sensor-id` long option
+- **main.c**: `sensor_id` global, hostname default
+- **pcap.c**: Prepend sensor ID frame in ZMQ publish functions
+- **tools/zmq_web_dashboard.py**: Frame parser, per-endpoint sockets,
+  sensor state tracking, multilateration algorithm, map visualization,
+  new CLI args (`--sensor-pos`, `--path-loss-exp`)
+
+### 7. Classic Bluetooth (BR/EDR) Detection Pipeline
+
+**Problem:**
+The sniffer already detected Classic BT sync words and extracted 24-bit LAPs
+(`btbb_find_ac()` in `btbb/btbb.c`), but only printed them in verbose mode.
+No PCAP output, no ZMQ publishing, no dashboard display.
+
+**Solution:**
+Wired Classic BT through the full pipeline alongside BLE:
+
+**C side:**
+- New `classic_bt_packet_t` struct in `bluetooth.h` (LAP, AC errors, RSSI,
+  noise, frequency, timestamp, 54-bit raw header)
+- `btbb_find_ac_offset()` wrapper that returns the bit offset of the sync
+  word (needed to extract the 54 header bits that follow the 64-bit AC)
+- `pcap_write_bt()` writes DLT_BLUETOOTH_BREDR_BB (255) headers compatible
+  with Wireshark's BR/EDR baseband dissector
+- PCAP always uses PPI encapsulation (DLT 192) with per-packet DLT field
+  to distinguish BLE (256) vs Classic BT (255) in the same file
+- ZMQ messages carry a 1-byte type prefix (0x00=BLE, 0x01=BT) for protocol
+  discrimination. Backward compatible with legacy subscribers.
+
+**Dashboard side:**
+- `parse_bt_packet()` parser for BREDR_BB headers
+- Classic BT devices tracked alongside BLE, keyed by `bt:xx:xx:xx` (LAP)
+- Protocol column with color-coded badges (blue=BLE, orange=BT)
+- Protocol filter dropdown (all / BLE only / BT only)
+- Summary breakdown by protocol
+
+**UAP Estimation:**
+For Classic BT devices, the dashboard reverses the HEC (Header Error Check)
+LFSR to recover the 8-bit Upper Address Part (UAP):
+
+1. Extract 54-bit FEC-encoded header from after the sync word
+2. For each of 64 possible CLK1-6 whitening values:
+   - De-whiten 54 bits using the BT data whitening LFSR (x^7 + x^4 + 1)
+   - FEC decode via 1/3 majority voting (54 -> 18 bits)
+   - Split into 10-bit header payload + 8-bit HEC
+   - Reverse the HEC LFSR (g(D) = D^8 + D^7 + D^5 + D^2 + D + 1) to
+     recover the candidate UAP
+3. Accumulate votes across packets. The correct UAP consistently appears
+   while wrong CLK1-6 values produce random candidates.
+4. Converge when the top candidate exceeds expected noise floor.
+
+The reverse HEC function matches libbtbb's `uap_from_hec()`: the BT spec
+initializes the HEC LFSR with `reverse(UAP)`, so the result must be
+bit-reversed after unwinding. Convergence typically occurs in 5-10 packets
+for strong signals.
+
+**Live Testing Results (USRP B210, 60 channels, 15 seconds):**
+
+| Metric | Value |
+|--------|-------|
+| BLE devices | 39 |
+| Classic BT devices | 5 |
+| UAP converged (100%) | 3 (in 6-1142 packets) |
+| UAP converging | 1 (55%, 112 packets) |
+| BLE CRC valid rate | ~82% (unaffected by BT additions) |
+
+**Files modified:**
+- **bluetooth.h**: `classic_bt_packet_t` struct, `pcap_write_bt()` declaration
+- **bluetooth.c**: `bluetooth_detect()` builds Classic BT packets, extracts
+  raw header bits
+- **btbb/btbb.h**: `btbb_find_ac_offset()` declaration
+- **btbb/btbb.c**: `btbb_find_ac_offset()` wrapper
+- **pcap.c**: `pcap_write_bt()`, always-PPI output, ZMQ type prefix byte
+- **pcap.h**: `pcap_write_bt()` declaration
+- **tools/zmq_web_dashboard.py**: `UAPEstimator` class, `parse_bt_packet()`,
+  protocol UI, mixed BLE/BT PCAP writing
+- **tools/zmq_subscriber.py**: Type prefix byte handling
+
+### 8. SQLite Device Database
+
+**Problem:**
+Each dashboard session starts with no memory of previously seen devices.
+There is no way to distinguish genuinely new devices from known ones, and
+no persistence of device metadata across sessions.
+
+**Solution:**
+Added a `DeviceDB` class backed by SQLite (stdlib, no new dependency):
+
+- Default path: `~/.cache/ice9-bt-sniffer/devices.db` (outside repo)
+- WAL mode + `PRAGMA synchronous=NORMAL` for non-blocking writes
+- Thread-safe with `threading.Lock`
+- Schema: `devices` table (dev_key, protocol, first/last seen, name, mfr,
+  identity, total packets, best RSSI, services) and `sessions` table
+- `is_new(dev_key)` checks an in-memory set of all known keys (fast, no query)
+- `upsert()` uses INSERT ON CONFLICT UPDATE, commits every 100 changes
+- Session tracking: records start/end time for each dashboard run
+
+**Integration:**
+- Enabled by default (opt-out via `--no-db`)
+- Custom path via `--db FILE`
+- "NEW" badge on devices not seen in any previous session
+- `first_ever` timestamp in API response and CSV export
+- Shutdown: updates session end time, commits, closes
+
+**Database growth:** One row per unique device (not per packet). Typical
+environments produce a few hundred to a few thousand unique devices over
+months of use, resulting in a database well under 1 MB.
+
+### 9. Device Alerting
+
+**Problem:**
+No way to be notified when a specific device appears or when a never-before-seen
+device enters the monitored area.
+
+**Solution:**
+Added an `AlertManager` class with three alert sources and four alert actions:
+
+**Alert sources:**
+- `--alert-file FILE`: watch list with one MAC, LAP (`bt:xx:xx:xx`), or
+  identity label (`[my-phone]`) per line
+- `--alert-new`: triggers for any device not in the SQLite database
+  (requires DB to be enabled)
+- Browser watch: click "watch" button in UI to add to in-session watch list
+
+**Alert actions:**
+- `--alert-cmd CMD`: shell command with environment variables
+  (`ALERT_MAC`, `ALERT_NAME`, `ALERT_MFR`, `ALERT_RSSI`, `ALERT_PROTOCOL`,
+  `ALERT_REASON`, `ALERT_IDENTITY`)
+- `--alert-webhook URL`: HTTP POST with JSON body
+- Browser notification via SSE push
+
+**Rate limiting:** `--alert-cooldown N` (default 300 seconds) per device
+prevents alert storms.
+
+**RPA handling:** When IRKs are loaded, resolved devices use their identity
+label as the device key, so RPA rotations do not trigger repeat alerts.
+Without IRKs, each new random MAC is treated as a new device.
+
 ## References
 
 - Bluetooth Core Specification Volume 6, Part B, Section 3.1.1 (CRC)
+- Bluetooth Core Specification Volume 2, Part B, Section 7.1.1 (HEC generation)
+- Bluetooth Core Specification Volume 2, Part B, Section 7.2 (Data whitening)
 - Bluetooth Core Specification Volume 3, Part H, Section 2.2.2 (RPA resolution, `ah()` function)
 - Bluetooth Core Specification Supplement, Part A, Section 1.5 (TX Power Level AD type)
 - Log-distance path loss model (free space, n=2.0) for 2.4 GHz BLE
-- PCAP DLT_BLUETOOTH_LE_LL_WITH_PHDR format specification
+- PCAP DLT_BLUETOOTH_LE_LL_WITH_PHDR (256) format specification
+- PCAP DLT_BLUETOOTH_BREDR_BB (255) format specification
+- PCAP PPI (DLT 192) Per-Packet Information header format

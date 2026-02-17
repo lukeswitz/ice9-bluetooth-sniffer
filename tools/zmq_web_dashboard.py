@@ -40,10 +40,13 @@ Requirements:
 
 import argparse
 import json
+import math
 import os
 import queue
 import signal
+import sqlite3
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -58,6 +61,226 @@ try:
 except ImportError:
     print("pyzmq is required: pip install pyzmq", file=sys.stderr)
     sys.exit(1)
+
+# ---------------------------------------------------------------------------
+# SQLite device persistence
+# ---------------------------------------------------------------------------
+class DeviceDB:
+    """SQLite-backed device persistence for cross-session tracking."""
+
+    DEFAULT_PATH = Path.home() / ".cache" / "ice9-bt-sniffer" / "devices.db"
+
+    def __init__(self, db_path=None):
+        self.path = Path(db_path) if db_path else self.DEFAULT_PATH
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(str(self.path), check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.lock = threading.Lock()
+        self._create_tables()
+        self.session_id = self._start_session()
+        self._known_keys = self._load_known_keys()
+        self._changes = 0
+
+    def _create_tables(self):
+        with self.conn:
+            self.conn.executescript("""
+                CREATE TABLE IF NOT EXISTS devices (
+                    dev_key TEXT PRIMARY KEY,
+                    protocol TEXT NOT NULL,
+                    first_seen REAL NOT NULL,
+                    last_seen REAL NOT NULL,
+                    name TEXT DEFAULT '',
+                    mfr TEXT DEFAULT '',
+                    identity TEXT,
+                    mac_type TEXT DEFAULT '',
+                    total_pkts INTEGER DEFAULT 0,
+                    best_rssi INTEGER DEFAULT -127,
+                    services TEXT DEFAULT ''
+                );
+                CREATE TABLE IF NOT EXISTS sessions (
+                    session_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    start_time REAL NOT NULL,
+                    end_time REAL
+                );
+                CREATE INDEX IF NOT EXISTS idx_devices_last_seen
+                    ON devices(last_seen);
+            """)
+
+    def _start_session(self):
+        with self.conn:
+            cur = self.conn.execute(
+                "INSERT INTO sessions (start_time) VALUES (?)",
+                (time.time(),))
+            return cur.lastrowid
+
+    def _load_known_keys(self):
+        cur = self.conn.execute("SELECT dev_key FROM devices")
+        return set(row[0] for row in cur.fetchall())
+
+    def is_new(self, dev_key):
+        return dev_key not in self._known_keys
+
+    def upsert(self, dev_key, protocol, now, name="", mfr="", identity=None,
+               mac_type="", rssi=-127, services=""):
+        with self.lock:
+            self.conn.execute("""
+                INSERT INTO devices
+                    (dev_key, protocol, first_seen, last_seen, name, mfr,
+                     identity, mac_type, total_pkts, best_rssi, services)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                ON CONFLICT(dev_key) DO UPDATE SET
+                    last_seen = MAX(excluded.last_seen, last_seen),
+                    total_pkts = total_pkts + 1,
+                    best_rssi = MAX(excluded.best_rssi, best_rssi),
+                    name = CASE WHEN excluded.name != '' THEN excluded.name
+                                ELSE name END,
+                    mfr = CASE WHEN excluded.mfr != '' THEN excluded.mfr
+                               ELSE mfr END,
+                    identity = COALESCE(excluded.identity, identity),
+                    services = CASE WHEN length(excluded.services) > length(services)
+                                    THEN excluded.services ELSE services END
+            """, (dev_key, protocol, now, now, name, mfr, identity, mac_type,
+                  rssi, services))
+            self._known_keys.add(dev_key)
+            self._changes += 1
+            if self._changes % 100 == 0:
+                self.conn.commit()
+
+    def get_first_seen(self, dev_key):
+        cur = self.conn.execute(
+            "SELECT first_seen FROM devices WHERE dev_key = ?", (dev_key,))
+        row = cur.fetchone()
+        return row[0] if row else None
+
+    def close(self):
+        with self.lock:
+            self.conn.execute(
+                "UPDATE sessions SET end_time = ? WHERE session_id = ?",
+                (time.time(), self.session_id))
+            self.conn.commit()
+            self.conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Device alerting
+# ---------------------------------------------------------------------------
+class AlertManager:
+    """Device alerting via shell commands, webhooks, and browser notifications."""
+
+    def __init__(self, watch_file=None, alert_cmd=None, alert_new=False,
+                 webhook_url=None, cooldown=300, db=None):
+        self.watch_set = set()
+        self.alert_cmd = alert_cmd
+        self.alert_new = alert_new
+        self.webhook_url = webhook_url
+        self.cooldown = cooldown
+        self.db = db
+        self.last_alert = {}
+        self.lock = threading.Lock()
+        self.pending_browser_alerts = []
+
+        if watch_file:
+            self._load_watch_file(watch_file)
+
+    def _load_watch_file(self, path):
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                self.watch_set.add(line.lower())
+        print(f"  Alert file: loaded {len(self.watch_set)} watch entries",
+              file=sys.stderr)
+
+    def check(self, dev_key, device_info):
+        now = time.time()
+
+        with self.lock:
+            if dev_key in self.last_alert:
+                if now - self.last_alert[dev_key] < self.cooldown:
+                    return
+
+            should_alert = False
+            alert_reason = ""
+
+            if dev_key.lower() in self.watch_set:
+                should_alert = True
+                alert_reason = "watchlist"
+            elif device_info.get("identity"):
+                label = f"[{device_info['identity']}]"
+                if label.lower() in self.watch_set:
+                    should_alert = True
+                    alert_reason = "watchlist-identity"
+
+            if not should_alert and self.alert_new and self.db:
+                if self.db.is_new(dev_key):
+                    should_alert = True
+                    alert_reason = "new-device"
+
+            if not should_alert:
+                return
+
+            self.last_alert[dev_key] = now
+
+        self._fire_alert(dev_key, device_info, alert_reason)
+
+    def _fire_alert(self, dev_key, device_info, reason):
+        alert_data = {
+            "mac": dev_key,
+            "name": device_info.get("name", ""),
+            "mfr": device_info.get("mfr", ""),
+            "rssi": device_info.get("rssi", -127),
+            "protocol": device_info.get("protocol", "BLE"),
+            "reason": reason,
+            "timestamp": time.time(),
+            "identity": device_info.get("identity"),
+        }
+
+        if self.alert_cmd:
+            self._exec_cmd(alert_data)
+
+        if self.webhook_url:
+            self._send_webhook(alert_data)
+
+        with self.lock:
+            self.pending_browser_alerts.append(alert_data)
+            if len(self.pending_browser_alerts) > 100:
+                self.pending_browser_alerts = self.pending_browser_alerts[-100:]
+
+    def _exec_cmd(self, alert_data):
+        env = os.environ.copy()
+        env["ALERT_MAC"] = str(alert_data["mac"])
+        env["ALERT_NAME"] = str(alert_data.get("name", ""))
+        env["ALERT_MFR"] = str(alert_data.get("mfr", ""))
+        env["ALERT_RSSI"] = str(alert_data.get("rssi", ""))
+        env["ALERT_PROTOCOL"] = str(alert_data.get("protocol", "BLE"))
+        env["ALERT_REASON"] = str(alert_data["reason"])
+        env["ALERT_IDENTITY"] = str(alert_data.get("identity") or "")
+        try:
+            subprocess.Popen(self.alert_cmd, shell=True, env=env,
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+        except Exception as e:
+            print(f"  Alert cmd failed: {e}", file=sys.stderr)
+
+    def _send_webhook(self, alert_data):
+        import urllib.request
+        try:
+            data = json.dumps(alert_data).encode()
+            req = urllib.request.Request(
+                self.webhook_url, data=data,
+                headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=5)
+        except Exception as e:
+            print(f"  Webhook failed: {e}", file=sys.stderr)
+
+    def get_pending_alerts(self):
+        with self.lock:
+            alerts = list(self.pending_browser_alerts)
+            self.pending_browser_alerts.clear()
+            return alerts
+
 
 # ---------------------------------------------------------------------------
 # IRK / RPA resolution (BT Core Spec Vol 3, Part H, Section 2.2.2)
@@ -160,8 +383,8 @@ def ppi_fixed3_7(val):
 def ppi_fixed6_4(val):
     return int((val + 180000.0) * 1e4)
 
-def build_ppi_gps_header(lat, lon, alt):
-    ppi_hdr = PPI_HDR.pack(0, 0, PPI_GPS_SIZE, DLT_BLUETOOTH_LE_LL_WITH_PHDR)
+def build_ppi_gps_header(lat, lon, alt, dlt=DLT_BLUETOOTH_LE_LL_WITH_PHDR):
+    ppi_hdr = PPI_HDR.pack(0, 0, PPI_GPS_SIZE, dlt)
     fld_hdr = PPI_FIELD_HDR.pack(PPI_FIELD_GPS, PPI_GPS.size)
     gps_data = PPI_GPS.pack(
         2, 0, PPI_GPS.size,
@@ -170,8 +393,180 @@ def build_ppi_gps_header(lat, lon, alt):
     )
     return ppi_hdr + fld_hdr + gps_data
 
-def build_ppi_passthrough_header():
-    return PPI_HDR.pack(0, 0, PPI_HDR_SIZE, DLT_BLUETOOTH_LE_LL_WITH_PHDR)
+def build_ppi_passthrough_header(dlt=DLT_BLUETOOTH_LE_LL_WITH_PHDR):
+    return PPI_HDR.pack(0, 0, PPI_HDR_SIZE, dlt)
+
+
+# ---------------------------------------------------------------------------
+# Classic BT (BR/EDR) support
+# ---------------------------------------------------------------------------
+DLT_BLUETOOTH_BREDR_BB = 255
+BREDR_BB_HDR = struct.Struct("<BbbBBBhIIIH")  # 22 bytes
+
+# ZMQ packet type prefix bytes (prepended by sniffer C code)
+ZMQ_PKT_TYPE_BLE = 0x00
+ZMQ_PKT_TYPE_BT  = 0x01
+
+BREDR_SIGNAL_POWER_VALID = 0x0004
+BREDR_NOISE_POWER_VALID  = 0x0008
+
+
+def parse_bt_packet(data):
+    """Parse a Classic BT PCAP record (pcaprec_hdr + BREDR_BB header + optional raw header)."""
+    if len(data) < PCAP_REC_HDR.size + BREDR_BB_HDR.size:
+        return None
+
+    ts_sec, ts_usec, incl_len, orig_len = PCAP_REC_HDR.unpack_from(data, 0)
+    offset = PCAP_REC_HDR.size
+
+    (rf_channel, signal_power, noise_power, ac_offenses,
+     ptt, corr_hdr, corr_payload, lap, ref_lap_uap,
+     bt_header, flags) = BREDR_BB_HDR.unpack_from(data, offset)
+    offset += BREDR_BB_HDR.size
+
+    # Raw FEC-encoded header bytes (7 bytes = 54 bits packed LSB-first)
+    raw_header = None
+    if len(data) >= offset + 7:
+        raw_header = data[offset:offset + 7]
+
+    mac = f"bt:{(lap >> 16) & 0xff:02x}:{(lap >> 8) & 0xff:02x}:{lap & 0xff:02x}"
+
+    return {
+        "timestamp": ts_sec + ts_usec / 1e6,
+        "rf_channel": rf_channel,
+        "freq_mhz": 2402 + rf_channel,
+        "signal_power": signal_power,
+        "noise_power": noise_power,
+        "lap": lap,
+        "ac_errors": ac_offenses,
+        "mac": mac,
+        "mac_type": "bt-lap",
+        "crc_checked": False,
+        "crc_valid": None,
+        "is_adv": False,
+        "pdu_type": "BT",
+        "fingerprint": {},
+        "protocol": "BT",
+        "raw_header": raw_header,
+        "data_len": incl_len,
+    }
+
+
+class UAPEstimator:
+    """Estimate Classic BT UAP from accumulated packet headers.
+
+    Uses the same HEC-reversal approach as libbtbb: for each packet's
+    54-bit FEC-encoded header, try all 64 CLK1-6 whitening sequences,
+    reverse the HEC LFSR to find which UAP would produce the observed
+    HEC, and accumulate votes. The correct UAP consistently appears
+    while wrong CLK1-6 values produce random UAPs.
+    """
+
+    def __init__(self):
+        self.uap_votes = [0] * 256
+        self.packet_count = 0
+        self.converged_uap = None
+        self.confidence = 0.0
+
+    def add_header(self, raw_header):
+        """Process a 54-bit FEC-encoded header (7 bytes, LSB-first packed)."""
+        if raw_header is None or len(raw_header) < 7:
+            return
+
+        self.packet_count += 1
+
+        # Unpack 54 bits from 7 bytes
+        bits_54 = []
+        for byte_idx in range(7):
+            for bit_idx in range(8):
+                if byte_idx * 8 + bit_idx >= 54:
+                    break
+                bits_54.append((raw_header[byte_idx] >> bit_idx) & 1)
+
+        # Try all 64 CLK1-6 whitening sequences
+        # Whitening is applied AFTER FEC encoding, so we must de-whiten
+        # the 54 bits first, then FEC decode to 18 bits
+        for clk in range(64):
+            wh = self._whitening_bits(clk, 54)
+            dw54 = [bits_54[j] ^ wh[j] for j in range(54)]
+
+            # FEC decode: 1/3 majority voting -> 18 bits
+            bits_18 = []
+            for i in range(18):
+                b0 = dw54[i * 3]
+                b1 = dw54[i * 3 + 1]
+                b2 = dw54[i * 3 + 2]
+                bits_18.append(1 if (b0 + b1 + b2) >= 2 else 0)
+
+            # Pack 10-bit header payload and 8-bit HEC
+            header_10 = 0
+            for j in range(10):
+                header_10 |= bits_18[j] << j
+            hec_8 = 0
+            for j in range(8):
+                hec_8 |= bits_18[10 + j] << j
+
+            uap = self._uap_from_hec(header_10, hec_8)
+            self.uap_votes[uap] += 1
+
+        # Check convergence at thresholds
+        if self.packet_count in (5, 10, 20, 50) or self.packet_count % 50 == 0:
+            self._check_convergence()
+
+    @staticmethod
+    def _whitening_bits(clk1_6, n):
+        """Generate n bits of BT data whitening (x^7 + x^4 + 1 LFSR)."""
+        reg = 0x40 | (clk1_6 & 0x3f)  # bit 6 forced to 1
+        bits = []
+        for _ in range(n):
+            bits.append(reg & 1)
+            fb = ((reg >> 6) ^ (reg >> 3)) & 1
+            reg = (reg >> 1) | (fb << 6)
+        return bits
+
+    @staticmethod
+    def _reverse8(byte):
+        """Bit-reverse an 8-bit value."""
+        byte = ((byte & 0xF0) >> 4) | ((byte & 0x0F) << 4)
+        byte = ((byte & 0xCC) >> 2) | ((byte & 0x33) << 2)
+        byte = ((byte & 0xAA) >> 1) | ((byte & 0x55) << 1)
+        return byte & 0xFF
+
+    @staticmethod
+    def _uap_from_hec(header_10, hec):
+        """Reverse HEC LFSR to find UAP (same algorithm as libbtbb).
+
+        The BT spec initializes the HEC LFSR with reverse(UAP), so after
+        unwinding the LFSR we must bit-reverse the result to get the UAP.
+        """
+        reg = hec
+        for i in range(9, -1, -1):
+            if reg & 0x80:
+                reg ^= 0x65
+            reg = ((reg << 1) & 0xff) | (((reg >> 7) ^ ((header_10 >> i) & 1)) & 1)
+        return UAPEstimator._reverse8(reg)
+
+    def _check_convergence(self):
+        if self.packet_count < 5:
+            return
+        best_uap = max(range(256), key=lambda i: self.uap_votes[i])
+        best_count = self.uap_votes[best_uap]
+        # Expected noise per UAP: each packet adds 63 random votes
+        # spread across 256 candidates (E = packet_count * 63/256)
+        expected_noise = self.packet_count * 63.0 / 256.0
+        # The correct UAP gets packet_count deterministic votes on top of noise
+        signal = best_count - expected_noise
+        if signal > 0 and self.packet_count > 0:
+            conf = signal / self.packet_count
+            if conf >= 0.5:
+                self.converged_uap = best_uap
+                self.confidence = min(conf, 1.0)
+
+    def get_result(self):
+        """Return (uap, confidence) or (None, 0.0) if not converged."""
+        if self.converged_uap is not None:
+            return (self.converged_uap, self.confidence)
+        return (None, 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -611,14 +1006,111 @@ def parse_ble_packet(data):
         "mac_type": mac_type,
         "data_len": len(ble_data),
         "fingerprint": fingerprint,
+        "protocol": "BLE",
     }
+
+
+# ---------------------------------------------------------------------------
+# Multilateration (position estimation from multiple sensors)
+# ---------------------------------------------------------------------------
+def _haversine_m(lat1, lon1, lat2, lon2):
+    """Haversine distance in meters between two lat/lon points."""
+    R = 6371000
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (math.sin(dlat / 2) ** 2 +
+         math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
+         math.sin(dlon / 2) ** 2)
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def _estimate_device_position(sensor_obs, sensors, tx_power, path_loss_exp):
+    """Estimate device position from multiple sensor distance estimates.
+
+    Returns (lat, lon, uncertainty_m, num_sensors) or None.
+    """
+    points = []
+    for sid, obs in sensor_obs.items():
+        s = sensors.get(sid)
+        if not s or s["lat"] is None:
+            continue
+        if obs["rssi_cnt"] == 0:
+            continue
+        rssi_avg = obs["rssi_sum"] / obs["rssi_cnt"]
+        measured_1m = tx_power - 41
+        dist = 10 ** ((measured_1m - rssi_avg) / (10.0 * path_loss_exp))
+        weight = min(obs["rssi_cnt"], 100) / 100.0
+        points.append((s["lat"], s["lon"], dist, weight))
+
+    if len(points) < 2:
+        return None
+
+    # Initial guess: centroid
+    lat0 = sum(p[0] for p in points) / len(points)
+    lon0 = sum(p[1] for p in points) / len(points)
+    m_per_deg_lat = 111320.0
+    m_per_deg_lon = 111320.0 * math.cos(math.radians(lat0))
+
+    sensors_m = [(
+        (lon - lon0) * m_per_deg_lon,
+        (lat - lat0) * m_per_deg_lat,
+        dist, w
+    ) for lat, lon, dist, w in points]
+
+    # Gauss-Newton weighted least squares
+    x_est, y_est = 0.0, 0.0
+    for _ in range(20):
+        A = []
+        b = []
+        W = []
+        for sx, sy, sd, sw in sensors_m:
+            dx = x_est - sx
+            dy = y_est - sy
+            d_calc = math.sqrt(dx * dx + dy * dy)
+            if d_calc < 0.1:
+                d_calc = 0.1
+            A.append([dx / d_calc, dy / d_calc])
+            b.append(sd - d_calc)
+            W.append(sw)
+
+        n = len(A)
+        ATA = [[0, 0], [0, 0]]
+        ATb = [0, 0]
+        for i in range(n):
+            for j in range(2):
+                for k in range(2):
+                    ATA[j][k] += W[i] * A[i][j] * A[i][k]
+                ATb[j] += W[i] * A[i][j] * b[i]
+
+        det = ATA[0][0] * ATA[1][1] - ATA[0][1] * ATA[1][0]
+        if abs(det) < 1e-10:
+            break
+        ddx = (ATA[1][1] * ATb[0] - ATA[0][1] * ATb[1]) / det
+        ddy = (-ATA[1][0] * ATb[0] + ATA[0][0] * ATb[1]) / det
+        x_est += ddx
+        y_est += ddy
+        if abs(ddx) < 0.01 and abs(ddy) < 0.01:
+            break
+
+    est_lat = lat0 + y_est / m_per_deg_lat
+    est_lon = lon0 + x_est / m_per_deg_lon
+
+    residuals = []
+    for sx, sy, sd, sw in sensors_m:
+        dx = x_est - sx
+        dy = y_est - sy
+        d_calc = math.sqrt(dx * dx + dy * dy)
+        residuals.append((sd - d_calc) ** 2 * sw)
+    uncertainty = math.sqrt(sum(residuals) / max(len(residuals), 1))
+
+    return (est_lat, est_lon, uncertainty, len(points))
 
 
 # ---------------------------------------------------------------------------
 # Shared dashboard state (device-centric, Kismet-style)
 # ---------------------------------------------------------------------------
 class DashboardState:
-    def __init__(self):
+    def __init__(self, static_positions=None, path_loss_exp=2.0):
         self.lock = threading.Lock()
         self.total_packets = 0
         self.crc_valid = 0
@@ -633,8 +1125,16 @@ class DashboardState:
         # Channel activity: rf_channel -> packet count
         self.channel_counts = {}
         self._dirty = True
+        # Multi-sensor tracking
+        self.sensors = {}  # sensor_id -> {lat, lon, last_seen, pkts}
+        self.device_sensor_rssi = {}  # dev_key -> {sensor_id -> {rssi_sum, rssi_cnt, last}}
+        self.static_positions = static_positions or {}
+        self.path_loss_exp = path_loss_exp
+        # Persistence and alerting (set externally after construction)
+        self.db = None          # DeviceDB instance
+        self.alert_mgr = None   # AlertManager instance
 
-    def add_packet(self, pkt, gps_info=None):
+    def add_packet(self, pkt, gps_info=None, sensor_id=None):
         with self.lock:
             self.total_packets += 1
             if pkt["crc_checked"]:
@@ -645,6 +1145,22 @@ class DashboardState:
             if gps_info:
                 self.gps_count += 1
                 self.last_gps = gps_info
+
+            # Update sensor state
+            if sensor_id:
+                if sensor_id not in self.sensors:
+                    self.sensors[sensor_id] = {"lat": None, "lon": None,
+                                               "last_seen": 0, "pkts": 0}
+                s = self.sensors[sensor_id]
+                s["last_seen"] = time.time()
+                s["pkts"] += 1
+                if gps_info:
+                    s["lat"] = round(gps_info[0], 6)
+                    s["lon"] = round(gps_info[1], 6)
+                elif sensor_id in self.static_positions:
+                    pos = self.static_positions[sensor_id]
+                    s["lat"] = pos[0]
+                    s["lon"] = pos[1]
 
             # Track channel activity
             rf_ch = pkt.get("rf_channel")
@@ -675,6 +1191,7 @@ class DashboardState:
                     dev_key = f"[{label}]"
 
             now = round(pkt["timestamp"], 6)
+            protocol = pkt.get("protocol", "BLE")
             fp = pkt.get("fingerprint", {})
             rssi = pkt["signal_power"]
 
@@ -715,9 +1232,19 @@ class DashboardState:
                 # Track resolved RPA addresses
                 if identity and "rpa_addrs" in d:
                     d["rpa_addrs"].add(mac)
+                # UAP estimation for Classic BT
+                if protocol == "BT" and "_uap_est" in d:
+                    raw_hdr = pkt.get("raw_header")
+                    if raw_hdr:
+                        d["_uap_est"].add_header(raw_hdr)
+                        uap, conf = d["_uap_est"].get_result()
+                        if uap is not None:
+                            d["uap"] = uap
+                            d["uap_conf"] = conf
             else:
                 d = {
                     "mac": dev_key,
+                    "protocol": protocol,
                     "first": now,
                     "last": now,
                     "freq": pkt["freq_mhz"],
@@ -744,7 +1271,46 @@ class DashboardState:
                 if gps_info:
                     d["lat"] = round(gps_info[0], 6)
                     d["lon"] = round(gps_info[1], 6)
+                # Classic BT: set up UAP estimator
+                if protocol == "BT":
+                    d["_uap_est"] = UAPEstimator()
+                    d["uap"] = None
+                    d["uap_conf"] = 0.0
+                    raw_hdr = pkt.get("raw_header")
+                    if raw_hdr:
+                        d["_uap_est"].add_header(raw_hdr)
                 self.devices[dev_key] = d
+
+            # Per-sensor RSSI tracking (for multilateration)
+            if sensor_id:
+                if dev_key not in self.device_sensor_rssi:
+                    self.device_sensor_rssi[dev_key] = {}
+                dsr = self.device_sensor_rssi[dev_key]
+                if sensor_id not in dsr:
+                    dsr[sensor_id] = {"rssi_sum": 0, "rssi_cnt": 0, "last": 0}
+                dsr[sensor_id]["rssi_sum"] += rssi
+                dsr[sensor_id]["rssi_cnt"] += 1
+                dsr[sensor_id]["last"] = now
+
+            # Persist to SQLite
+            if self.db:
+                svc_str = "|".join(d.get("services", []))
+                self.db.upsert(
+                    dev_key=dev_key,
+                    protocol=d.get("protocol", "BLE"),
+                    now=now,
+                    name=d.get("name", ""),
+                    mfr=d.get("mfr", ""),
+                    identity=d.get("identity"),
+                    mac_type=d.get("mac_type", ""),
+                    rssi=rssi,
+                    services=svc_str,
+                )
+
+            # Alerting
+            if self.alert_mgr:
+                self.alert_mgr.check(dev_key, d)
+
             self._dirty = True
 
     def get_stats(self):
@@ -777,21 +1343,64 @@ class DashboardState:
                 tx = d.get("tx_pwr")
                 if tx is not None and dd["rssi_avg"] < 0:
                     measured = tx - 41  # RSSI at 1m for BLE 2.4 GHz
-                    dd["est_dist"] = round(10 ** ((measured - dd["rssi_avg"]) / 20.0), 1)
+                    dd["est_dist"] = round(10 ** ((measured - dd["rssi_avg"]) / (10.0 * self.path_loss_exp)), 1)
                 else:
                     dd["est_dist"] = None
+                # Multilateration
+                dev_key = d["mac"]
+                dd["est_lat"] = None
+                dd["est_lon"] = None
+                dd["est_unc"] = None
+                dd["num_sensors"] = 0
+                if tx is not None and dev_key in self.device_sensor_rssi:
+                    obs = self.device_sensor_rssi[dev_key]
+                    result = _estimate_device_position(
+                        obs, self.sensors, tx, self.path_loss_exp)
+                    if result:
+                        dd["est_lat"] = round(result[0], 6)
+                        dd["est_lon"] = round(result[1], 6)
+                        dd["est_unc"] = round(result[2], 1)
+                        dd["num_sensors"] = result[3]
+                # Persistence fields
+                dd["is_new"] = False
+                dd["first_ever"] = None
+                if self.db:
+                    dd["is_new"] = self.db.is_new(dev_key)
+                    fs = self.db.get_first_seen(dev_key)
+                    if fs is not None:
+                        dd["first_ever"] = fs
                 # IRK resolution fields
                 rpa_addrs = d.get("rpa_addrs")
                 dd["identity"] = d.get("identity")
                 dd["rpa_count"] = len(rpa_addrs) if rpa_addrs else 0
                 if rpa_addrs:
                     del dd["rpa_addrs"]
-                # Don't send internal accumulators
+                # Don't send internal accumulators or non-serializable objects
                 del dd["rssi_sum"]
                 del dd["rssi_cnt"]
+                dd.pop("_uap_est", None)
                 devs.append(dd)
             devs.sort(key=lambda x: x["last"], reverse=True)
             return devs
+
+    def get_sensors(self):
+        """Return list of known sensors with their positions."""
+        with self.lock:
+            result = []
+            seen = set()
+            for sid, s in self.sensors.items():
+                seen.add(sid)
+                result.append({
+                    "id": sid, "lat": s["lat"], "lon": s["lon"],
+                    "last_seen": s["last_seen"], "pkts": s["pkts"],
+                })
+            for label, (lat, lon) in self.static_positions.items():
+                if label not in seen:
+                    result.append({
+                        "id": label, "lat": lat, "lon": lon,
+                        "last_seen": 0, "pkts": 0,
+                    })
+            return result
 
     def get_summary(self):
         """Return aggregate breakdowns for the summary tab."""
@@ -800,9 +1409,13 @@ class DashboardState:
             by_mac_type = {}
             by_pdu = {}
             by_svc = {}
+            by_protocol = {}
             svc_device_count = 0
             top_talkers = []
             for d in self.devices.values():
+                # Protocol
+                proto = d.get("protocol", "BLE")
+                by_protocol[proto] = by_protocol.get(proto, 0) + 1
                 # Manufacturer
                 m = d["mfr"] or "Unknown"
                 by_mfr[m] = by_mfr.get(m, 0) + 1
@@ -848,6 +1461,7 @@ class DashboardState:
                 ch_dist[ble_ch] = ch_dist.get(ble_ch, 0) + cnt
 
             return {
+                "by_protocol": sorted_dict(by_protocol),
                 "by_mfr": sorted_dict(by_mfr),
                 "by_mac_type": sorted_dict(by_mac_type),
                 "by_pdu": sorted_dict(by_pdu),
@@ -894,10 +1508,31 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._serve_json(state.get_devices())
         elif path == "/api/summary":
             self._serve_json(state.get_summary())
+        elif path == "/api/sensors":
+            self._serve_json(state.get_sensors())
         elif path == "/api/export.csv":
             self._serve_csv()
         elif path == "/api/export.json":
             self._serve_export_json()
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if path == "/api/watch":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length))
+                mac = body.get("mac", "")
+                watch = body.get("watch", False)
+                if state.alert_mgr:
+                    if watch:
+                        state.alert_mgr.watch_set.add(mac.lower())
+                    else:
+                        state.alert_mgr.watch_set.discard(mac.lower())
+                self._serve_json({"ok": True})
+            except Exception:
+                self.send_error(400)
         else:
             self.send_error(404)
 
@@ -921,10 +1556,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/csv")
         self.send_header("Content-Disposition", "attachment; filename=ble_devices.csv")
         self.end_headers()
-        cols = ["mac", "mac_type", "identity", "rpa_count", "mfr", "apple",
+        cols = ["mac", "protocol", "mac_type", "identity", "rpa_count",
+                "uap", "uap_conf", "mfr", "apple",
                 "name", "appear", "services", "type", "rssi", "rssi_min",
-                "rssi_avg", "tx_pwr", "est_dist", "pkts", "crc_ok",
-                "crc_bad", "freq", "first", "last"]
+                "rssi_avg", "tx_pwr", "est_dist", "num_sensors",
+                "est_lat", "est_lon", "est_unc", "pkts", "crc_ok",
+                "crc_bad", "freq", "first", "last", "first_ever", "is_new"]
         self.wfile.write((",".join(cols) + "\n").encode())
         for d in devs:
             row = []
@@ -966,7 +1603,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 devs = state.get_devices()
                 stats = state.get_stats()
                 summary = state.get_summary()
-                payload = json.dumps({"stats": stats, "devices": devs, "summary": summary})
+                sensors = state.get_sensors()
+                alerts = []
+                if state.alert_mgr:
+                    alerts = state.alert_mgr.get_pending_alerts()
+                payload = json.dumps({"stats": stats, "devices": devs,
+                                      "summary": summary, "sensors": sensors,
+                                      "alerts": alerts})
                 self.wfile.write(f"event: update\ndata: {payload}\n\n".encode())
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionError, OSError):
@@ -984,66 +1627,149 @@ class DashboardHandler(BaseHTTPRequestHandler):
 running = True
 
 
+def parse_zmq_frames(frames):
+    """Parse ZMQ multipart message, returning (sensor_id, gps_info, pcap_data).
+
+    Handles all frame formats:
+      1 frame:  [PCAP]                     -> (None, None, pcap)
+      2 frames: [GPS_24b] [PCAP]           -> (None, gps, pcap)   legacy
+      2 frames: [SENSOR_ID] [PCAP]         -> (id, None, pcap)    new, no GPS
+      3 frames: [SENSOR_ID] [GPS_24b] [PCAP] -> (id, gps, pcap)  new, with GPS
+    """
+    sensor_id = None
+    gps_info = None
+
+    if len(frames) == 1:
+        pcap_data = frames[0]
+    elif len(frames) == 2:
+        if len(frames[0]) == ZMQ_GPS_FRAME.size:
+            lat, lon, alt = ZMQ_GPS_FRAME.unpack(frames[0])
+            if -90 <= lat <= 90 and -180 <= lon <= 180:
+                gps_info = (lat, lon, alt)
+            else:
+                sensor_id = frames[0].decode("utf-8", errors="replace")
+        else:
+            sensor_id = frames[0].decode("utf-8", errors="replace")
+        pcap_data = frames[1]
+    elif len(frames) >= 3:
+        sensor_id = frames[0].decode("utf-8", errors="replace")
+        if len(frames[1]) == ZMQ_GPS_FRAME.size:
+            lat, lon, alt = ZMQ_GPS_FRAME.unpack(frames[1])
+            gps_info = (lat, lon, alt)
+        pcap_data = frames[-1]
+    else:
+        return None, None, None
+
+    return sensor_id, gps_info, pcap_data
+
+
+def _process_zmq_message(frames, pcap_file, use_gps, fallback_sensor_id=None):
+    """Process a ZMQ message: parse frames, write PCAP, update state."""
+    sensor_id, gps_info, pcap_data = parse_zmq_frames(frames)
+    if pcap_data is None:
+        return
+
+    if sensor_id is None:
+        sensor_id = fallback_sensor_id
+
+    # Detect type prefix byte (new format: 0x00=BLE, 0x01=BT)
+    pkt_type = ZMQ_PKT_TYPE_BLE
+    raw_pcap = pcap_data
+    if len(pcap_data) > PCAP_REC_HDR.size and pcap_data[0] <= ZMQ_PKT_TYPE_BT:
+        pkt_type = pcap_data[0]
+        raw_pcap = pcap_data[1:]
+
+    # Write PCAP if requested (always PPI-wrapped for mixed BLE/BT support)
+    if pcap_file:
+        pkt_dlt = DLT_BLUETOOTH_LE_LL_WITH_PHDR if pkt_type == ZMQ_PKT_TYPE_BLE else DLT_BLUETOOTH_BREDR_BB
+        ts_sec, ts_usec, incl_len, orig_len = PCAP_REC_HDR.unpack_from(raw_pcap, 0)
+        payload = raw_pcap[PCAP_REC_HDR.size:]
+        if gps_info:
+            ppi_hdr = build_ppi_gps_header(*gps_info, dlt=pkt_dlt)
+        else:
+            ppi_hdr = build_ppi_passthrough_header(dlt=pkt_dlt)
+        new_len = len(ppi_hdr) + len(payload)
+        pcap_file.write(PCAP_REC_HDR.pack(ts_sec, ts_usec, new_len, new_len))
+        pcap_file.write(ppi_hdr)
+        pcap_file.write(payload)
+        pcap_file.flush()
+
+    # Parse based on packet type
+    if pkt_type == ZMQ_PKT_TYPE_BT:
+        pkt = parse_bt_packet(raw_pcap)
+    else:
+        pkt = parse_ble_packet(raw_pcap)
+
+    if pkt:
+        state.add_packet(pkt, gps_info, sensor_id)
+
+
 def zmq_receiver(endpoints, server_key_path, pcap_file, use_gps, bind_mode=False):
     ctx = zmq.Context()
-    sub = ctx.socket(zmq.SUB)
-    sub.setsockopt(zmq.SUBSCRIBE, b"")
-    sub.setsockopt(zmq.RCVTIMEO, 1000)
 
-    if server_key_path:
-        server_public_key = parse_server_pubkey(server_key_path)
-        client_public, client_secret = zmq.curve_keypair()
-        sub.setsockopt(zmq.CURVE_SERVERKEY, server_public_key)
-        sub.setsockopt(zmq.CURVE_PUBLICKEY, client_public)
-        sub.setsockopt(zmq.CURVE_SECRETKEY, client_secret)
-
-    for ep in endpoints:
-        if bind_mode:
+    if bind_mode:
+        # Bind mode: single socket, sensor ID comes from ZMQ frame
+        sub = ctx.socket(zmq.SUB)
+        sub.setsockopt(zmq.SUBSCRIBE, b"")
+        sub.setsockopt(zmq.RCVTIMEO, 1000)
+        if server_key_path:
+            server_public_key = parse_server_pubkey(server_key_path)
+            client_public, client_secret = zmq.curve_keypair()
+            sub.setsockopt(zmq.CURVE_SERVERKEY, server_public_key)
+            sub.setsockopt(zmq.CURVE_PUBLICKEY, client_public)
+            sub.setsockopt(zmq.CURVE_SECRETKEY, client_secret)
+        for ep in endpoints:
             sub.bind(ep)
             print(f"  Listening on {ep} (bind mode)", file=sys.stderr)
-        else:
+
+        while running:
+            try:
+                frames = sub.recv_multipart()
+            except zmq.Again:
+                continue
+            except zmq.ZMQError:
+                break
+            _process_zmq_message(frames, pcap_file, use_gps)
+
+        sub.close()
+    else:
+        # Connect mode: one socket per endpoint for sensor identification
+        poller = zmq.Poller()
+        sockets = {}  # socket -> endpoint label
+        for ep in endpoints:
+            sub = ctx.socket(zmq.SUB)
+            sub.setsockopt(zmq.SUBSCRIBE, b"")
+            sub.setsockopt(zmq.RCVTIMEO, 1000)
+            if server_key_path:
+                server_public_key = parse_server_pubkey(server_key_path)
+                client_public, client_secret = zmq.curve_keypair()
+                sub.setsockopt(zmq.CURVE_SERVERKEY, server_public_key)
+                sub.setsockopt(zmq.CURVE_PUBLICKEY, client_public)
+                sub.setsockopt(zmq.CURVE_SECRETKEY, client_secret)
             sub.connect(ep)
+            sockets[sub] = ep
+            poller.register(sub, zmq.POLLIN)
             print(f"  Connected to {ep}", file=sys.stderr)
 
-    while running:
-        try:
-            frames = sub.recv_multipart()
-        except zmq.Again:
-            continue
-        except zmq.ZMQError:
-            break
+        while running:
+            try:
+                ready = dict(poller.poll(1000))
+            except zmq.ZMQError:
+                break
 
-        gps_info = None
-        if len(frames) >= 2 and len(frames[0]) == ZMQ_GPS_FRAME.size:
-            lat, lon, alt = ZMQ_GPS_FRAME.unpack(frames[0])
-            gps_info = (lat, lon, alt)
-            pcap_data = frames[1]
-        else:
-            pcap_data = frames[-1]
+            for sock, label in sockets.items():
+                if sock not in ready:
+                    continue
+                try:
+                    frames = sock.recv_multipart(zmq.NOBLOCK)
+                except zmq.Again:
+                    continue
+                _process_zmq_message(frames, pcap_file, use_gps,
+                                     fallback_sensor_id=label)
 
-        # Write PCAP if requested
-        if pcap_file:
-            if use_gps:
-                ts_sec, ts_usec, incl_len, orig_len = PCAP_REC_HDR.unpack_from(pcap_data, 0)
-                payload = pcap_data[PCAP_REC_HDR.size:]
-                if gps_info:
-                    ppi_hdr = build_ppi_gps_header(*gps_info)
-                else:
-                    ppi_hdr = build_ppi_passthrough_header()
-                new_len = len(ppi_hdr) + len(payload)
-                pcap_file.write(PCAP_REC_HDR.pack(ts_sec, ts_usec, new_len, new_len))
-                pcap_file.write(ppi_hdr)
-                pcap_file.write(payload)
-                pcap_file.flush()
-            else:
-                pcap_file.write(pcap_data)
-                pcap_file.flush()
+        for sock in sockets:
+            sock.close()
 
-        pkt = parse_ble_packet(pcap_data)
-        if pkt:
-            state.add_packet(pkt, gps_info)
-
-    sub.close()
     ctx.term()
 
 
@@ -1119,6 +1845,12 @@ tr.fresh td { background: #1a2a1a; }
 .org { color: #ca6; }
 .yel { color: #ec5; }
 .masked { color: #666; }
+.badge { display: inline-block; padding: 0 4px; border-radius: 2px; font-size: 9px;
+         font-weight: bold; }
+.badge-ble { background: #234; color: #68f; }
+.badge-bt { background: #342; color: #ca6; }
+select.filter { font: 11px monospace; background: #333; color: #ccc; border: 1px solid #555;
+                padding: 1px 4px; }
 
 #map { flex: 1; width: 100%; }
 .empty { padding: 40px; text-align: center; color: #555; }
@@ -1164,6 +1896,11 @@ tr.fresh td { background: #1a2a1a; }
     <div class="tab active" data-tab="devices" onclick="switchTab('devices')">devices</div>
     <div class="tab" data-tab="summary" onclick="switchTab('summary')">summary</div>
   </div>
+  <select class="filter" id="protoFilter" onchange="renderDevices()" title="Protocol filter">
+    <option value="all">all</option>
+    <option value="BLE">BLE only</option>
+    <option value="BT">BT only</option>
+  </select>
   <span class="spacer"></span>
   <button onclick="location.href='/api/export.csv'">export CSV</button>
   <button onclick="location.href='/api/export.json'">export JSON</button>
@@ -1184,6 +1921,7 @@ tr.fresh td { background: #1a2a1a; }
     <table>
       <thead><tr>
         <th data-col="last" class="sorted">last seen</th>
+        <th data-col="protocol">proto</th>
         <th data-col="mac">mac</th>
         <th data-col="mac_type">addr</th>
         <th data-col="mfr">manufacturer</th>
@@ -1192,9 +1930,11 @@ tr.fresh td { background: #1a2a1a; }
         <th data-col="type">type</th>
         <th data-col="rssi">rssi</th>
         <th data-col="est_dist">dist</th>
+        <th data-col="num_sensors">sensors</th>
         <th data-col="pkts" class="count">pkts</th>
         <th data-col="crc">crc %</th>
         <th data-col="first">first seen</th>
+        <th></th>
       </tr></thead>
       <tbody id="tb"></tbody>
     </table>
@@ -1204,6 +1944,7 @@ tr.fresh td { background: #1a2a1a; }
 
 <div class="panel" id="panelSummary">
   <div class="summary-grid" id="summaryGrid">
+    <div class="summary-card" id="cardProto"><h3>by protocol</h3></div>
     <div class="summary-card" id="cardMfr"><h3>by manufacturer</h3></div>
     <div class="summary-card" id="cardAddr"><h3>by address type</h3></div>
     <div class="summary-card" id="cardPdu"><h3>by PDU type</h3></div>
@@ -1313,9 +2054,29 @@ function svcLabel(d) {
   return s.slice(0,2).join(', ') + ' +' + (s.length-2);
 }
 
+function protoBadge(proto) {
+  if (proto === 'BT') return '<span class="badge badge-bt">BT</span>';
+  return '<span class="badge badge-ble">BLE</span>';
+}
+
+function btMacLabel(d) {
+  // Classic BT: show LAP, and UAP if converged
+  if (d.uap != null) {
+    const uap = ('0'+d.uap.toString(16)).slice(-2);
+    return d.mac.replace('bt:', 'bt:'+uap+':');
+  }
+  if (d.uap_conf != null && d.uap_conf === 0 && d.pkts > 0) {
+    return d.mac + ' <span class="dim" style="font-size:9px">(UAP?)</span>';
+  }
+  return d.mac;
+}
+
 function renderDevices() {
   const now = Date.now() / 1000;
-  const sorted = sortDevices(devices);
+  const pf = document.getElementById('protoFilter').value;
+  let filtered = devices;
+  if (pf !== 'all') filtered = devices.filter(d => (d.protocol||'BLE') === pf);
+  const sorted = sortDevices(filtered);
   document.getElementById('empty').style.display = sorted.length ? 'none' : 'block';
 
   const frag = document.createDocumentFragment();
@@ -1323,21 +2084,30 @@ function renderDevices() {
     const tr = document.createElement('tr');
     const fresh = (now - d.last) < 3;
     if (fresh) tr.className = 'fresh';
-    let mc = priv ? mask(d.mac) : d.mac;
-    let macCls = priv ? 'masked' : '';
-    if (d.identity) {
-      mc = priv ? '[hidden]' : d.mac;
-      macCls = 'grn';
-      if (!priv && d.rpa_count > 1) mc += ' ('+d.rpa_count+' addrs)';
+    const proto = d.protocol || 'BLE';
+    let mc, macCls;
+    if (proto === 'BT') {
+      mc = priv ? 'bt:xx:xx:xx' : btMacLabel(d);
+      macCls = priv ? 'masked' : 'org';
+    } else {
+      mc = priv ? mask(d.mac) : d.mac;
+      macCls = priv ? 'masked' : '';
+      if (d.identity) {
+        mc = priv ? '[hidden]' : d.mac;
+        macCls = 'grn';
+        if (!priv && d.rpa_count > 1) mc += ' ('+d.rpa_count+' addrs)';
+      }
     }
+    if (d.is_new) mc += ' <span style="color:#f55;font-size:9px;font-weight:bold">NEW</span>';
     const dist = d.est_dist != null ? '~'+d.est_dist+'m' : '';
     const total = d.crc_ok + d.crc_bad;
     const crcPct = total > 0 ? Math.round(100*d.crc_ok/total)+'%' : '-';
     const crcCls = total > 0 ? (d.crc_ok/total > 0.8 ? 'grn' : d.crc_ok/total > 0.4 ? 'yel' : 'red') : 'dim';
-    const isAdv = d.type !== 'DATA';
+    const isAdv = d.type !== 'DATA' && d.type !== 'BT';
     const mt = d.mac_type || '';
     tr.innerHTML =
       `<td class="dim">${ago(d.last)}</td>`+
+      `<td>${protoBadge(proto)}</td>`+
       `<td class="${macCls}">${mc}</td>`+
       `<td class="${addrCls(mt)}">${mt}</td>`+
       `<td>${mfrLabel(d)}</td>`+
@@ -1346,9 +2116,11 @@ function renderDevices() {
       `<td class="${isAdv?'blu':'org'}">${d.type}</td>`+
       `<td>${rssiLabel(d)}</td>`+
       `<td class="dim">${dist}</td>`+
+      `<td class="dim">${d.num_sensors||''}</td>`+
       `<td class="count">${d.pkts.toLocaleString()}</td>`+
       `<td class="${crcCls}">${crcPct}</td>`+
-      `<td class="dim">${fmtT(d.first)}</td>`;
+      `<td class="dim">${fmtT(d.first)}</td>`+
+      `<td><button onclick="toggleWatch('${d.mac.replace(/'/g,"\\'")}')" style="font-size:9px;padding:1px 5px;cursor:pointer;background:${watched.has(d.mac)?'#754':'#333'};color:#ccc;border:1px solid #555;border-radius:3px">${watched.has(d.mac)?'unwatch':'watch'}</button></td>`;
     frag.appendChild(tr);
   }
   tb.innerHTML = '';
@@ -1416,6 +2188,7 @@ function renderChannels(data) {
 }
 
 function renderSummary(s) {
+  renderBarChart('cardProto', s.by_protocol, '#8c8', 4);
   renderBarChart('cardMfr', s.by_mfr, barColors.mfr, 12);
   renderBarChart('cardAddr', s.by_mac_type, barColors.addr, 8);
   renderBarChart('cardPdu', s.by_pdu, barColors.pdu, 8);
@@ -1453,6 +2226,74 @@ function updStats(s) {
   }
 }
 
+/* --- Multi-sensor map markers --- */
+let sensorMarkers = {};
+let deviceMarkers = {};
+
+function updateSensors(sensors) {
+  if (!map) return;
+  for (const s of sensors) {
+    if (s.lat == null || s.lon == null) continue;
+    if (sensorMarkers[s.id]) {
+      sensorMarkers[s.id].setLatLng([s.lat, s.lon]);
+      sensorMarkers[s.id].unbindTooltip();
+      sensorMarkers[s.id].bindTooltip(s.id+' ('+s.pkts.toLocaleString()+' pkts)');
+    } else {
+      const m = L.marker([s.lat, s.lon], {
+        icon: L.divIcon({
+          className: '',
+          html: '<div style="background:#f80;color:#000;padding:2px 6px;border-radius:3px;font:bold 10px monospace;white-space:nowrap;border:1px solid #a50">'+s.id+'</div>',
+          iconSize: null, iconAnchor: [0, 0]
+        })
+      }).addTo(map);
+      m.bindTooltip(s.id+' ('+s.pkts.toLocaleString()+' pkts)');
+      sensorMarkers[s.id] = m;
+      map.setView([s.lat, s.lon], 15);
+    }
+  }
+}
+
+function updateDevicePositions(devs) {
+  if (!map) return;
+  const now = Date.now()/1000;
+  const shown = new Set();
+  for (const d of devs) {
+    if (d.est_lat == null || d.est_lon == null) continue;
+    const key = d.mac;
+    shown.add(key);
+    let color = d.num_sensors >= 3 ? '#4c4' : d.num_sensors === 2 ? '#cc4' : '#c44';
+    const unc = d.est_unc || 50;
+    const label = priv ? 'device' : (d.name || d.mac);
+    const tip = label+' ~'+(d.est_dist||'?')+'m, '+d.num_sensors+' sensor'+(d.num_sensors!==1?'s':'');
+    if (deviceMarkers[key]) {
+      deviceMarkers[key].dot.setLatLng([d.est_lat, d.est_lon]);
+      deviceMarkers[key].ring.setLatLng([d.est_lat, d.est_lon]);
+      deviceMarkers[key].ring.setRadius(unc);
+      deviceMarkers[key].dot.setStyle({color:color, fillColor:color});
+      deviceMarkers[key].ring.setStyle({color:color, fillColor:color});
+      deviceMarkers[key].dot.unbindTooltip();
+      deviceMarkers[key].dot.bindTooltip(tip);
+    } else {
+      const dot = L.circleMarker([d.est_lat, d.est_lon], {
+        radius:5, color:color, fillColor:color, fillOpacity:0.7, weight:1
+      }).addTo(map);
+      const ring = L.circle([d.est_lat, d.est_lon], {
+        radius:unc, color:color, fillColor:color, fillOpacity:0.1,
+        weight:1, dashArray:'4 4'
+      }).addTo(map);
+      dot.bindTooltip(tip);
+      deviceMarkers[key] = {dot, ring};
+    }
+  }
+  for (const key of Object.keys(deviceMarkers)) {
+    if (!shown.has(key)) {
+      map.removeLayer(deviceMarkers[key].dot);
+      map.removeLayer(deviceMarkers[key].ring);
+      delete deviceMarkers[key];
+    }
+  }
+}
+
 if (GPS) {
   const tab = document.createElement('div');
   tab.className = 'tab';
@@ -1474,6 +2315,22 @@ const es = new EventSource('/events');
 const cn = document.getElementById('conn');
 es.onopen = ()=>{ cn.textContent='connected'; cn.className='status ok'; };
 es.onerror = ()=>{ cn.textContent='disconnected'; cn.className='status'; };
+// Alerting: notification permission + watched devices
+if ('Notification' in window && Notification.permission === 'default') {
+  Notification.requestPermission();
+}
+const watched = new Set();
+function toggleWatch(mac) {
+  if (watched.has(mac)) watched.delete(mac);
+  else watched.add(mac);
+  renderDevices();
+  fetch('/api/watch', {
+    method: 'POST',
+    body: JSON.stringify({mac: mac, watch: watched.has(mac)}),
+    headers: {'Content-Type': 'application/json'}
+  }).catch(()=>{});
+}
+
 es.addEventListener('update', e => {
   const d = JSON.parse(e.data);
   devices = d.devices;
@@ -1481,6 +2338,20 @@ es.addEventListener('update', e => {
   updStats(d.stats);
   renderDevices();
   if (curTab === 'summary') renderSummary(summary);
+  if (d.sensors && map) updateSensors(d.sensors);
+  if (devices && map) updateDevicePositions(devices);
+  // Browser alerts
+  if (d.alerts && d.alerts.length > 0) {
+    for (const a of d.alerts) {
+      const title = a.reason === 'new-device' ? 'New Device' : 'Watched Device';
+      const body = a.mac + ' ' + (a.name||'') + ' (' + a.protocol + ', RSSI: ' + a.rssi + ')';
+      if ('Notification' in window && Notification.permission === 'granted') {
+        new Notification(title, { body: body, tag: a.mac });
+      }
+      const tb2 = document.querySelector('.toolbar');
+      if (tb2) { tb2.style.background='#532'; setTimeout(()=>{tb2.style.background='#252525';},2000); }
+    }
+  }
 });
 </script>
 </body>
@@ -1511,6 +2382,26 @@ def main():
                         help="Download/update Bluetooth numbers database from Nordic Semiconductor, then run")
     parser.add_argument("--irk-file", metavar="FILE",
                         help="File of IRKs for RPA resolution (format: label:hex per line)")
+    parser.add_argument("--sensor-pos", action="append", metavar="LABEL:LAT,LON",
+                        help="Static position for sensor without GPS (repeatable)")
+    parser.add_argument("--path-loss-exp", type=float, default=2.0,
+                        help="Path loss exponent for distance estimation (default: 2.0)")
+    # SQLite persistence
+    parser.add_argument("--db", metavar="FILE",
+                        help="SQLite database path (default: ~/.cache/ice9-bt-sniffer/devices.db)")
+    parser.add_argument("--no-db", action="store_true",
+                        help="Disable SQLite device persistence")
+    # Device alerting
+    parser.add_argument("--alert-file", metavar="FILE",
+                        help="File of MAC/LAP/identity labels to watch (one per line)")
+    parser.add_argument("--alert-cmd", metavar="CMD",
+                        help="Shell command on alert (env: ALERT_MAC, ALERT_NAME, ALERT_RSSI, ...)")
+    parser.add_argument("--alert-new", action="store_true",
+                        help="Alert on devices never seen before (requires DB)")
+    parser.add_argument("--alert-webhook", metavar="URL",
+                        help="HTTP POST URL for alert notifications")
+    parser.add_argument("--alert-cooldown", type=int, default=300,
+                        help="Seconds between re-alerts for same device (default: 300)")
     args = parser.parse_args()
 
     # Update Bluetooth numbers database if requested
@@ -1532,6 +2423,44 @@ def main():
 
     gps_enabled = args.gps
 
+    # Parse static sensor positions
+    static_positions = {}
+    if args.sensor_pos:
+        for sp in args.sensor_pos:
+            try:
+                label, coords = sp.split(":", 1)
+                lat, lon = coords.split(",")
+                static_positions[label.strip()] = (float(lat), float(lon))
+            except (ValueError, IndexError):
+                print(f"  Warning: invalid --sensor-pos '{sp}' (expected LABEL:LAT,LON)",
+                      file=sys.stderr)
+
+    # Re-initialize state with multilateration config
+    global state
+    state = DashboardState(static_positions=static_positions,
+                           path_loss_exp=args.path_loss_exp)
+
+    # SQLite persistence (on by default)
+    if not args.no_db:
+        db_path = args.db or DeviceDB.DEFAULT_PATH
+        state.db = DeviceDB(db_path)
+        n_known = len(state.db._known_keys)
+        print(f"  Database:   {db_path} ({n_known} known devices)", file=sys.stderr)
+
+    # Device alerting
+    if args.alert_file or args.alert_new or args.alert_cmd or args.alert_webhook:
+        state.alert_mgr = AlertManager(
+            watch_file=args.alert_file,
+            alert_cmd=args.alert_cmd,
+            alert_new=args.alert_new,
+            webhook_url=args.alert_webhook,
+            cooldown=args.alert_cooldown,
+            db=state.db,
+        )
+        if args.alert_new and not state.db:
+            print("  Warning: --alert-new requires database (remove --no-db)",
+                  file=sys.stderr)
+
     def sig_handler(sig, frame):
         global running
         running = False
@@ -1541,11 +2470,9 @@ def main():
     pcap_file = None
     if args.write:
         pcap_file = open(args.write, "wb")
-        dlt = DLT_PPI if args.gps else DLT_BLUETOOTH_LE_LL_WITH_PHDR
-        snaplen = 4 + 2 + 255 + 3
-        if args.gps:
-            snaplen += PPI_GPS_SIZE
-        pcap_file.write(PCAP_GLOBAL_HDR.pack(0xA1B2C3D4, 2, 4, 0, 0, snaplen, dlt))
+        # Always PPI (DLT 192) to support mixed BLE + Classic BT per-packet DLT
+        snaplen = PPI_GPS_SIZE + 4 + 2 + 255 + 3
+        pcap_file.write(PCAP_GLOBAL_HDR.pack(0xA1B2C3D4, 2, 4, 0, 0, snaplen, DLT_PPI))
         pcap_file.flush()
 
     # Start ZMQ receiver thread
@@ -1564,12 +2491,15 @@ def main():
     print(f"  {'='*40}", file=sys.stderr)
     print(f"  Dashboard:  http://localhost:{args.port}", file=sys.stderr)
     if args.write:
-        dlt_name = "DLT 192 (PPI+GPS)" if args.gps else "DLT 256 (BLE)"
-        print(f"  PCAP file:  {args.write} ({dlt_name})", file=sys.stderr)
+        print(f"  PCAP file:  {args.write} (DLT 192 PPI, BLE+BT)", file=sys.stderr)
     print(f"  Privacy:    MAC addresses hidden by default", file=sys.stderr)
     if _irk_list:
         print(f"  IRK file:   {args.irk_file} ({len(_irk_list)} key(s))", file=sys.stderr)
-    print(f"  Distance:   estimated from TX power + RSSI (free space)", file=sys.stderr)
+    n = args.path_loss_exp
+    print(f"  Distance:   estimated from TX power + RSSI (n={n})", file=sys.stderr)
+    if static_positions:
+        for label, (lat, lon) in static_positions.items():
+            print(f"  Sensor pos: {label} ({lat}, {lon})", file=sys.stderr)
     print(f"  {'='*40}\n", file=sys.stderr)
 
     try:
@@ -1586,6 +2516,10 @@ def main():
     if pcap_file:
         pcap_file.close()
         print(f"PCAP written to {args.write}", file=sys.stderr)
+
+    if state.db:
+        state.db.close()
+        print(f"Database saved.", file=sys.stderr)
 
     print("Dashboard stopped.", file=sys.stderr)
 

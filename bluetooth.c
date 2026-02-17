@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "bluetooth.h"
 #include "btbb/btbb.h"
@@ -346,9 +347,37 @@ ble_packet_t *ble_burst(uint8_t *bits, unsigned bits_len, unsigned freq, struct 
 }
 
 void bluetooth_detect(uint8_t *bits, unsigned len, float *demod, unsigned demod_len, unsigned silence_offset, unsigned freq, unsigned rssi, unsigned noise, struct timespec timestamp, uint32_t *lap_out, uint32_t *aa_out) {
-    uint32_t lap = btbb_find_ac((char *)bits, len, 1);
+    int ac_offset = -1;
+    uint8_t ac_errors = 0;
+    uint32_t lap = btbb_find_ac_offset((char *)bits, len, 1,
+                                        &ac_offset, &ac_errors);
     if (lap != 0xffffffff) {
         *lap_out = lap;
+
+        // Build Classic BT packet for PCAP/ZMQ
+        classic_bt_packet_t bt_pkt = {0};
+        bt_pkt.lap = lap;
+        bt_pkt.ac_errors = ac_errors;
+        bt_pkt.rssi_db = rssi;
+        bt_pkt.noise_db = noise;
+        bt_pkt.freq = freq;
+        bt_pkt.timestamp = timestamp;
+
+        // Extract 54 raw header bits after the 64-bit sync word
+        unsigned header_start = ac_offset + 64;
+        if (header_start + 54 <= len) {
+            bt_pkt.has_header = 1;
+            memset(bt_pkt.raw_header, 0, sizeof(bt_pkt.raw_header));
+            for (unsigned i = 0; i < 54; i++)
+                bt_pkt.raw_header[i / 8] |= (bits[header_start + i] & 1) << (i % 8);
+        }
+
+        if (pcap
+#ifdef HAVE_ZMQ
+            || zmq_pub_active
+#endif
+        )
+            pcap_write_bt(pcap, &bt_pkt);
     } else {
         // Try preamble-first detection, then fall back to AA correlator
         ble_packet_t *p = ble_burst(bits, len, freq, timestamp);

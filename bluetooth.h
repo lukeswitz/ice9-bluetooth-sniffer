@@ -23,4 +23,15 @@ typedef struct _ble_packet_t {
     uint8_t data[0]; // data starts at AA
 } ble_packet_t;
 
+typedef struct _classic_bt_packet_t {
+    uint32_t lap;
+    uint8_t ac_errors;
+    int rssi_db;
+    int noise_db;
+    unsigned freq;              // frequency in MHz
+    struct timespec timestamp;
+    uint8_t raw_header[7];      // 54 FEC-encoded header bits packed LSB-first
+    uint8_t has_header;         // 1 if raw_header was captured
+} classic_bt_packet_t;
+
 #endif
