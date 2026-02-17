@@ -7,3 +7,6 @@ build/
 .vscode/
 *.key
 *.key.pub
+*.db
+*.pcap
+__pycache__/

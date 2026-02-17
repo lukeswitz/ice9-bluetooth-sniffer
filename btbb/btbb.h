@@ -11,5 +11,8 @@ void gen_syndrome_map(int bit_errors);
 uint32_t btbb_find_ac(char *stream,
            int search_length,
            int max_ac_errors);
+uint32_t btbb_find_ac_offset(char *stream, int search_length,
+           int max_ac_errors, int *offset_out,
+           uint8_t *ac_errors_out);
 
 #endif /* __BTBB_H__ */
