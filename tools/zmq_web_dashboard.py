@@ -2444,8 +2444,6 @@ def main():
     if not args.no_db:
         db_path = args.db or DeviceDB.DEFAULT_PATH
         state.db = DeviceDB(db_path)
-        n_known = len(state.db._known_keys)
-        print(f"  Database:   {db_path} ({n_known} known devices)", file=sys.stderr)
 
     # Device alerting
     if args.alert_file or args.alert_new or args.alert_cmd or args.alert_webhook:
@@ -2497,6 +2495,11 @@ def main():
         print(f"  IRK file:   {args.irk_file} ({len(_irk_list)} key(s))", file=sys.stderr)
     n = args.path_loss_exp
     print(f"  Distance:   estimated from TX power + RSSI (n={n})", file=sys.stderr)
+    if state.db:
+        n_known = len(state.db._known_keys)
+        print(f"  Database:   {state.db.path} ({n_known} known devices)", file=sys.stderr)
+    else:
+        print(f"  Database:   disabled (--no-db)", file=sys.stderr)
     if static_positions:
         for label, (lat, lon) in static_positions.items():
             print(f"  Sensor pos: {label} ({lat}, {lon})", file=sys.stderr)
