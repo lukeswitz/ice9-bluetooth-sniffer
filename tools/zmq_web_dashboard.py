@@ -1122,8 +1122,9 @@ class DashboardState:
         self.sse_queues = []
         # Device table: mac -> device info dict
         self.devices = {}
-        # Channel activity: rf_channel -> packet count
-        self.channel_counts = {}
+        # Channel activity: rf_channel -> packet count (per protocol)
+        self.ble_channel_counts = {}
+        self.bt_channel_counts = {}
         self._dirty = True
         # Multi-sensor tracking
         self.sensors = {}  # sensor_id -> {lat, lon, last_seen, pkts}
@@ -1162,10 +1163,14 @@ class DashboardState:
                     s["lat"] = pos[0]
                     s["lon"] = pos[1]
 
-            # Track channel activity
+            # Track channel activity per protocol
             rf_ch = pkt.get("rf_channel")
+            protocol = pkt.get("protocol", "BLE")
             if rf_ch is not None:
-                self.channel_counts[rf_ch] = self.channel_counts.get(rf_ch, 0) + 1
+                if protocol == "BT":
+                    self.bt_channel_counts[rf_ch] = self.bt_channel_counts.get(rf_ch, 0) + 1
+                else:
+                    self.ble_channel_counts[rf_ch] = self.ble_channel_counts.get(rf_ch, 0) + 1
 
             mac = pkt["mac"]
             if not mac:
@@ -1442,9 +1447,9 @@ class DashboardState:
             def sorted_dict(d):
                 return sorted(d.items(), key=lambda x: x[1], reverse=True)
 
-            # Channel distribution: convert rf_channel to BLE channel number
-            ch_dist = {}
-            for rf_ch, cnt in self.channel_counts.items():
+            # BLE channel distribution: convert rf_channel to BLE channel number
+            ble_ch_dist = {}
+            for rf_ch, cnt in self.ble_channel_counts.items():
                 freq = 2402 + rf_ch * 2
                 if freq == 2402:
                     ble_ch = 37
@@ -1458,7 +1463,12 @@ class DashboardState:
                     ble_ch = (freq - 2428) // 2 + 11
                 else:
                     ble_ch = rf_ch
-                ch_dist[ble_ch] = ch_dist.get(ble_ch, 0) + cnt
+                ble_ch_dist[ble_ch] = ble_ch_dist.get(ble_ch, 0) + cnt
+
+            # BT channel distribution: rf_channel is already BT channel (freq = 2402 + ch)
+            bt_ch_dist = {}
+            for rf_ch, cnt in self.bt_channel_counts.items():
+                bt_ch_dist[rf_ch] = bt_ch_dist.get(rf_ch, 0) + cnt
 
             return {
                 "by_protocol": sorted_dict(by_protocol),
@@ -1469,7 +1479,8 @@ class DashboardState:
                 "svc_devices": svc_device_count,
                 "total_devices": len(self.devices),
                 "top_talkers": top10,
-                "channels": sorted(ch_dist.items()),
+                "ble_channels": sorted(ble_ch_dist.items()),
+                "bt_channels": sorted(bt_ch_dist.items()),
             }
 
     def is_dirty(self):
@@ -1950,7 +1961,8 @@ select.filter { font: 11px monospace; background: #333; color: #ccc; border: 1px
     <div class="summary-card" id="cardPdu"><h3>by PDU type</h3></div>
     <div class="summary-card" id="cardSvc"><h3>services seen (devices)</h3></div>
     <div class="summary-card wide" id="cardTop"><h3>top talkers (by packets)</h3></div>
-    <div class="summary-card full" id="cardCh"><h3>channel activity</h3></div>
+    <div class="summary-card full" id="cardBleCh"><h3>BLE channel activity</h3></div>
+    <div class="summary-card full" id="cardBtCh"><h3>BT channel activity</h3></div>
   </div>
 </div>
 
@@ -2167,18 +2179,18 @@ function renderTopTalkers(data) {
   el.innerHTML = html;
 }
 
-function renderChannels(data) {
-  const el = document.getElementById('cardCh');
+function renderChannels(cardId, data, color, advHighlight) {
+  const el = document.getElementById(cardId);
   const h3 = el.querySelector('h3').outerHTML;
   if (!data || !data.length) { el.innerHTML = h3 + '<div class="dim" style="padding:8px">no data</div>'; return; }
   const max = Math.max(...data.map(d => d[1]));
   let html = h3 + '<div class="ch-grid">';
   for (const [ch, cnt] of data) {
-    const intensity = max > 0 ? cnt / max : 0;
-    const r = Math.round(40 + intensity * 80);
-    const g = Math.round(40 + intensity * 140);
-    const b = Math.round(40 + intensity * 60);
-    const isAdv = ch >= 37;
+    const intensity = max > 0 ? Math.max(0.15, Math.sqrt(cnt / max)) : 0;
+    const r = Math.round(30 + intensity * color[0]);
+    const g = Math.round(30 + intensity * color[1]);
+    const b = Math.round(30 + intensity * color[2]);
+    const isAdv = advHighlight && ch >= 37;
     const border = isAdv ? 'border-color:#ca6' : '';
     html += `<div class="ch-cell" style="background:rgb(${r},${g},${b});${border}" `+
       `title="Ch ${ch}: ${cnt.toLocaleString()} pkts">${ch}</div>`;
@@ -2201,7 +2213,8 @@ function renderSummary(s) {
     ctx.textContent = s.svc_devices + ' of ' + s.total_devices + ' devices advertise GATT services (most use mfr-specific data)';
   }
   renderTopTalkers(s.top_talkers);
-  renderChannels(s.channels);
+  renderChannels('cardBleCh', s.ble_channels, [80,140,60], true);
+  renderChannels('cardBtCh', s.bt_channels, [140,100,40], false);
 }
 
 function updStats(s) {
