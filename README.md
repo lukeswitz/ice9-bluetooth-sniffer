@@ -83,6 +83,7 @@ Optional:
     -I, --install           Install into Wireshark extcap folder
     -Z, --zmq-pub=ENDPOINT  Publish packets via ZMQ PUB socket
     -K, --zmq-curve-key=FILE  Enable CURVE encryption (requires key file)
+        --sensor-id=NAME      Sensor identity for multi-sensor deployments
 ```
 
 ### Examples
@@ -289,6 +290,10 @@ summaries.
 - **GPS mapping**: `--gps` flag enables GPS column and live map display
   (requires gpsd running, GPS coordinates embedded in PPI-wrapped PCAPs)
 - **CURVE encryption**: `--server-key` flag for encrypted ZMQ connections
+- **Multi-sensor multilateration**: when 2+ sensors with known GPS positions
+  observe the same device, estimates device position on the map using weighted
+  least squares. Sensors identified by `--sensor-id` on the sniffer side,
+  positions from GPS or `--sensor-pos` on the dashboard.
 - **Multi-sensor**: accepts multiple ZMQ endpoints for distributed deployments
 
 **Dashboard options:**
@@ -303,6 +308,8 @@ python3 tools/zmq_web_dashboard.py [endpoints...] [options]
   --bind                    Bind SUB socket instead of connecting
   --update-bt-db            Download/refresh Bluetooth numbers database
   --irk-file FILE           File of IRKs for RPA resolution (label:hex per line)
+  --sensor-pos LABEL:LAT,LON  Static sensor position (repeatable)
+  --path-loss-exp N         Path loss exponent (default: 2.0, indoor: 2.5-3.5)
 ```
 
 **Examples:**
@@ -319,6 +326,13 @@ python3 tools/zmq_web_dashboard.py [endpoints...] [options]
 
     # RPA resolution with Identity Resolving Keys:
     python3 tools/zmq_web_dashboard.py tcp://localhost:5555 --irk-file irks.txt
+
+    # Multi-sensor multilateration with static positions:
+    python3 tools/zmq_web_dashboard.py tcp://sensor1:5555 tcp://sensor2:5555 \
+        --sensor-pos roof:37.7749,-122.4194 --sensor-pos lobby:37.7751,-122.4190
+
+    # Multi-sensor with GPS (sensors have gpsd running):
+    python3 tools/zmq_web_dashboard.py tcp://sensor1:5555 tcp://sensor2:5555 --gps
 
 **Bluetooth Numbers Database:**
 

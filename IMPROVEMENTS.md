@@ -9,6 +9,7 @@ This document describes improvements made to ice9-bluetooth-sniffer:
 3. OpenCL GPU acceleration for the polyphase channelizer + FFT
 4. Distance estimation from TX Power Level + RSSI
 5. IRK-based RPA resolution for tracking devices with rotating MACs
+6. Multi-sensor multilateration for BLE device position estimation
 
 ## Changes Made
 
@@ -306,6 +307,92 @@ when `--irk-file` is actually used. No new dependencies otherwise.
 ```bash
 python3 tools/zmq_web_dashboard.py tcp://localhost:5555 --irk-file irks.txt
 ```
+
+### 6. Multi-Sensor Multilateration
+
+**Problem:**
+The dashboard already supports multiple ZMQ sensor endpoints, but treats
+them as interchangeable packet sources. There is no way to determine
+*where* a BLE device is located, even when multiple sensors with known
+GPS positions observe the same device at different signal strengths.
+
+**Solution:**
+Implemented sensor identification, per-sensor RSSI tracking, and
+multilateration (position estimation from distance circles).
+
+**Sniffer side (`--sensor-id`):**
+- New `--sensor-id NAME` flag sets the sensor identity string
+- Defaults to hostname if not specified
+- Sensor ID is prepended as the first ZMQ frame in every message
+- Backward compatible: old subscribers that read the last frame still work
+
+**Dashboard side:**
+- Frame parser handles all 4 ZMQ frame formats (legacy 1-frame, legacy
+  2-frame GPS, new 2-frame with sensor ID, new 3-frame with both)
+- Per-endpoint SUB sockets with `zmq.Poller` in connect mode, so the
+  dashboard knows which endpoint each packet came from
+- Per-sensor state tracking: GPS position, packet count, last seen
+- Per-device-per-sensor RSSI tracking for distance estimation
+- New `/api/sensors` endpoint returns sensor positions and stats
+
+**Multilateration algorithm:**
+- Per-sensor distance from RSSI: `d = 10^((tx_power - 41 - rssi) / (10*n))`
+  where n is the path loss exponent (default 2.0 for free space)
+- Weight: `min(packet_count, 100) / 100` (more observations = more reliable)
+- 2+ sensors: Gauss-Newton iterative weighted least squares in local
+  meter coordinates (lat/lon converted to meters from centroid, solve,
+  convert back)
+- Uncertainty: weighted RMS of distance residuals (meters)
+- Only computed for devices advertising TX Power Level (AD type 0x0A)
+
+**Map visualization (Leaflet.js):**
+- Sensor markers: orange labeled pins at each sensor's GPS position
+- Device markers: colored circles at estimated position
+  - Green: 3+ sensors (best confidence)
+  - Yellow: 2 sensors
+- Dashed uncertainty circles showing estimated error radius
+- Tooltips with device name/MAC, distance, and sensor count
+- Stale entries removed automatically
+
+**New dashboard CLI args:**
+- `--sensor-pos LABEL:LAT,LON` (repeatable) -- static position for
+  sensors without GPS
+- `--path-loss-exp N` (default 2.0) -- path loss exponent for distance
+  estimation. Free space = 2.0, typical indoor = 2.5-3.5
+
+**Synthetic test results:**
+- 3 sensors in equilateral triangle, device at center: 0m error
+- 2 sensors, device between them: ~26m error (expected with only 2 circles)
+- 1 sensor: no position estimate (requires minimum 2)
+
+**Performance:**
+- C side: one additional small `zmq_send()` per packet (sensor ID frame)
+- Dashboard: per-packet dict lookup for sensor RSSI tracking
+- Multilateration math runs once per second in the SSE path, only for
+  devices with TX Power seen by 2+ sensors
+- No measurable throughput impact
+
+**Usage:**
+```bash
+# Sensor 1 (has GPS):
+ice9-bluetooth -l -c 2441 -C 60 --zmq-pub tcp://*:5555 --check-crc --sensor-id roof
+
+# Sensor 2 (no GPS, static position):
+ice9-bluetooth -l -c 2441 -C 60 --zmq-pub tcp://*:5556 --check-crc --sensor-id lobby
+
+# Dashboard with multilateration:
+python3 tools/zmq_web_dashboard.py tcp://sensor1:5555 tcp://sensor2:5556 \
+    --gps --sensor-pos lobby:37.7751,-122.4190
+```
+
+## Files Modified (Multilateration)
+
+- **options.c**: Added `--sensor-id` long option
+- **main.c**: `sensor_id` global, hostname default
+- **pcap.c**: Prepend sensor ID frame in ZMQ publish functions
+- **tools/zmq_web_dashboard.py**: Frame parser, per-endpoint sockets,
+  sensor state tracking, multilateration algorithm, map visualization,
+  new CLI args (`--sensor-pos`, `--path-loss-exp`)
 
 ## References
 
