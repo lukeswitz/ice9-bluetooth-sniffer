@@ -1156,8 +1156,11 @@ def _haversine_m(lat1, lon1, lat2, lon2):
 
 
 def _estimate_device_position(sensor_obs, sensors, tx_power, path_loss_exp,
-                               cal_offset=0.0, gain_delta=0.0):
+                               cal_offset=0.0):
     """Estimate device position from multiple sensor distance estimates.
+
+    rssi_ema values are expected to already be normalized to the initial-gain
+    reference frame (gain_delta applied at storage time in add_packet).
 
     Returns (lat, lon, uncertainty_m, num_sensors) or None.
     """
@@ -1168,7 +1171,7 @@ def _estimate_device_position(sensor_obs, sensors, tx_power, path_loss_exp,
             continue
         if obs["rssi_ema"] is None:
             continue
-        rssi_val = obs["rssi_ema"] - cal_offset - gain_delta
+        rssi_val = obs["rssi_ema"] - cal_offset
         measured_1m = tx_power - 41
         dist = 10 ** ((measured_1m - rssi_val) / (10.0 * path_loss_exp))
         weight = 1.0
@@ -1270,6 +1273,7 @@ class DashboardState:
         self.alert_mgr = None   # AlertManager instance
 
     def add_packet(self, pkt, gps_info=None, sensor_id=None):
+        global current_vga_gain, current_lna_gain, initial_vga_gain, initial_lna_gain
         with self.lock:
             self.total_packets += 1
             if pkt["crc_checked"]:
@@ -1335,7 +1339,16 @@ class DashboardState:
             now = round(pkt["timestamp"], 6)
             protocol = pkt.get("protocol", "BLE")
             fp = pkt.get("fingerprint", {})
-            rssi = pkt["signal_power"]
+            rssi_raw = pkt["signal_power"]
+            # Normalize to initial-gain reference frame at storage time so the
+            # running mean/min/max are consistent across gain changes.
+            # Sentinel (>= 0) is a hardware "no data" marker — never adjust it.
+            if rssi_raw < 0:
+                _gain_offset = ((current_vga_gain + current_lna_gain)
+                                - (initial_vga_gain + initial_lna_gain))
+                rssi = rssi_raw - _gain_offset
+            else:
+                rssi = rssi_raw
 
             if dev_key in self.devices:
                 d = self.devices[dev_key]
@@ -1496,7 +1509,7 @@ class DashboardState:
 
     def get_devices(self):
         """Return device list sorted by last-seen (most recent first)."""
-        global rssi_calibration_offset, initial_vga_gain, initial_lna_gain, current_vga_gain, current_lna_gain
+        global rssi_calibration_offset
         with self.lock:
             self._dirty = False
             devs = []
@@ -1507,13 +1520,14 @@ class DashboardState:
                     dd["rssi"] = round(d["rssi"])
                 dd["rssi_min"] = round(d["rssi_min"]) if d.get("rssi_min") is not None else None
                 dd["rssi_max"] = round(d["rssi_max"]) if d.get("rssi_max") is not None else None
-                # Distance estimation from TX power + RSSI mean
+                # Distance estimation from TX power + RSSI mean.
+                # RSSI is already normalized to initial-gain frame at storage time,
+                # so only the fixed calibration offset is applied here.
                 tx = d.get("tx_pwr")
-                gain_delta = (current_vga_gain + current_lna_gain) - (initial_vga_gain + initial_lna_gain)
                 if tx is not None and d["rssi"] is not None and d["rssi"] < 0:
-                    raw_rssi = d["rssi"] - rssi_calibration_offset - gain_delta
-                    measured = tx - 41  # RSSI at 1m for BLE 2.4 GHz
-                    dd["est_dist"] = round(10 ** ((measured - raw_rssi) / (10.0 * self.path_loss_exp)), 1)
+                    corrected_rssi = d["rssi"] - rssi_calibration_offset
+                    measured = tx - 41  # expected RSSI at 1m for BLE 2.4 GHz
+                    dd["est_dist"] = round(10 ** ((measured - corrected_rssi) / (10.0 * self.path_loss_exp)), 1)
                 else:
                     dd["est_dist"] = None
                 # Multilateration
@@ -1526,7 +1540,7 @@ class DashboardState:
                     obs = self.device_sensor_rssi[dev_key]
                     result = _estimate_device_position(
                         obs, self.sensors, tx, self.path_loss_exp,
-                        cal_offset=rssi_calibration_offset, gain_delta=gain_delta)
+                        cal_offset=rssi_calibration_offset)
                     if result:
                         dd["est_lat"] = round(result[0], 6)
                         dd["est_lon"] = round(result[1], 6)
