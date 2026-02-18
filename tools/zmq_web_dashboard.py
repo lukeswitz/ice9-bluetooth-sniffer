@@ -2097,15 +2097,6 @@ def zmq_receiver(endpoints, server_key_path, pcap_file, use_gps, bind_mode=False
         for sock in sockets:
             sock.close()
 
-        pkt = parse_ble_packet(pcap_data)
-        if pkt:
-            state.add_packet(pkt, gps_info)
-        else:
-            # DEBUG: Log parse failures
-            if state.total_packets < 5:
-                print(f"  DEBUG: parse_ble_packet returned None - pcap_data len={len(pcap_data)}", file=sys.stderr)
-
-    sub.close()
     ctx.term()
 
 
