@@ -408,7 +408,10 @@ void *zmq_control_thread(void *arg) {
     return NULL;
 }
 
-static void zmq_pub_packet(pcaprec_hdr_t *ph, pcap_le_header_t *lh, uint8_t *data, unsigned len) {
+static void zmq_pub_raw(uint8_t type_byte, pcaprec_hdr_t *ph,
+                         void *ll_hdr, size_t ll_len,
+                         void *data, size_t data_len,
+                         zmq_gps_frame_t *gps) {
     if (!zmq_pub)
         return;
     unsigned msg_len = 1 + sizeof(*ph) + ll_len + data_len;

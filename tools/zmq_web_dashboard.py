@@ -1024,7 +1024,8 @@ def _haversine_m(lat1, lon1, lat2, lon2):
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
-def _estimate_device_position(sensor_obs, sensors, tx_power, path_loss_exp):
+def _estimate_device_position(sensor_obs, sensors, tx_power, path_loss_exp,
+                               cal_offset=0.0, gain_delta=0.0):
     """Estimate device position from multiple sensor distance estimates.
 
     Returns (lat, lon, uncertainty_m, num_sensors) or None.
@@ -1034,12 +1035,12 @@ def _estimate_device_position(sensor_obs, sensors, tx_power, path_loss_exp):
         s = sensors.get(sid)
         if not s or s["lat"] is None:
             continue
-        if obs["rssi_cnt"] == 0:
+        if obs["rssi_ema"] is None:
             continue
-        rssi_avg = obs["rssi_sum"] / obs["rssi_cnt"]
+        rssi_val = obs["rssi_ema"] - cal_offset - gain_delta
         measured_1m = tx_power - 41
-        dist = 10 ** ((measured_1m - rssi_avg) / (10.0 * path_loss_exp))
-        weight = min(obs["rssi_cnt"], 100) / 100.0
+        dist = 10 ** ((measured_1m - rssi_val) / (10.0 * path_loss_exp))
+        weight = 1.0
         points.append((s["lat"], s["lon"], dist, weight))
 
     if len(points) < 2:
@@ -1128,9 +1129,10 @@ class DashboardState:
         self._dirty = True
         # Multi-sensor tracking
         self.sensors = {}  # sensor_id -> {lat, lon, last_seen, pkts}
-        self.device_sensor_rssi = {}  # dev_key -> {sensor_id -> {rssi_sum, rssi_cnt, last}}
+        self.device_sensor_rssi = {}  # dev_key -> {sensor_id -> {rssi_ema, last}}
         self.static_positions = static_positions or {}
         self.path_loss_exp = path_loss_exp
+        self.watch_set = set()  # MACs watched via UI (persists for session)
         # Persistence and alerting (set externally after construction)
         self.db = None          # DeviceDB instance
         self.alert_mgr = None   # AlertManager instance
@@ -1206,13 +1208,15 @@ class DashboardState:
                 d["last"] = now
                 d["freq"] = pkt["freq_mhz"]
                 d["type"] = pkt["pdu_type"]
-                # RSSI tracking: best, min, sum, count
-                if rssi > d["rssi"]:
-                    d["rssi"] = rssi
-                if rssi < d["rssi_min"]:
-                    d["rssi_min"] = rssi
-                d["rssi_sum"] += rssi
-                d["rssi_cnt"] += 1
+                # RSSI: exponential moving average, alpha=0.2 (~5 packets to converge).
+                # Symmetric — asymmetric attack/decay is too susceptible to multipath
+                # spikes that push EMA near 0, producing bogus short-distance estimates.
+                # Skips >= 0 — hardware sentinel for "no RSSI data" on most SDRs.
+                if rssi < 0:
+                    if d["rssi"] is None:
+                        d["rssi"] = float(rssi)
+                    else:
+                        d["rssi"] = 0.2 * rssi + 0.8 * d["rssi"]
                 if pkt["crc_valid"]:
                     d["crc_ok"] += 1
                 elif pkt["crc_valid"] is False:
@@ -1253,10 +1257,7 @@ class DashboardState:
                     "first": now,
                     "last": now,
                     "freq": pkt["freq_mhz"],
-                    "rssi": rssi,
-                    "rssi_min": rssi,
-                    "rssi_sum": rssi,
-                    "rssi_cnt": 1,
+                    "rssi": float(rssi) if rssi < 0 else None,
                     "type": pkt["pdu_type"],
                     "pkts": 1,
                     "crc_ok": 1 if pkt["crc_valid"] else 0,
@@ -1292,10 +1293,14 @@ class DashboardState:
                     self.device_sensor_rssi[dev_key] = {}
                 dsr = self.device_sensor_rssi[dev_key]
                 if sensor_id not in dsr:
-                    dsr[sensor_id] = {"rssi_sum": 0, "rssi_cnt": 0, "last": 0}
-                dsr[sensor_id]["rssi_sum"] += rssi
-                dsr[sensor_id]["rssi_cnt"] += 1
-                dsr[sensor_id]["last"] = now
+                    dsr[sensor_id] = {"rssi_ema": None, "last": 0}
+                obs = dsr[sensor_id]
+                if rssi < 0:
+                    if obs["rssi_ema"] is None:
+                        obs["rssi_ema"] = float(rssi)
+                    else:
+                        obs["rssi_ema"] = 0.2 * rssi + 0.8 * obs["rssi_ema"]
+                obs["last"] = now
 
             # Persist to SQLite
             if self.db:
@@ -1342,21 +1347,17 @@ class DashboardState:
             self._dirty = False
             devs = []
             for d in self.devices.values():
-                # Add computed avg RSSI for the JSON output
                 dd = dict(d)
-                dd["rssi_avg"] = round(d["rssi_sum"] / d["rssi_cnt"]) if d["rssi_cnt"] else d["rssi"]
-                # Distance estimation from TX power + avg RSSI
-                # Note: RSSI values are calibrated, so we need to subtract the offset for distance calc
+                # Round EMA for display/JSON
+                if d["rssi"] is not None:
+                    dd["rssi"] = round(d["rssi"])
+                # Distance estimation from TX power + RSSI EMA
                 tx = d.get("tx_pwr")
-                if tx is not None and dd["rssi_avg"] < 0:
-                    # Calculate gain delta (current - initial)
-                    gain_delta = (current_vga_gain + current_lna_gain) - (initial_vga_gain + initial_lna_gain)
-
-                    # Subtract calibration offset and gain delta to get raw RSSI for distance formula
-                    # Higher gain = higher measured RSSI, so subtract gain increase
-                    raw_rssi = dd["rssi_avg"] - rssi_calibration_offset - gain_delta
+                gain_delta = (current_vga_gain + current_lna_gain) - (initial_vga_gain + initial_lna_gain)
+                if tx is not None and d["rssi"] is not None and d["rssi"] < 0:
+                    raw_rssi = d["rssi"] - rssi_calibration_offset - gain_delta
                     measured = tx - 41  # RSSI at 1m for BLE 2.4 GHz
-                    dd["est_dist"] = round(10 ** ((measured - dd["rssi_avg"]) / (10.0 * self.path_loss_exp)), 1)
+                    dd["est_dist"] = round(10 ** ((measured - raw_rssi) / (10.0 * self.path_loss_exp)), 1)
                 else:
                     dd["est_dist"] = None
                 # Multilateration
@@ -1368,12 +1369,15 @@ class DashboardState:
                 if tx is not None and dev_key in self.device_sensor_rssi:
                     obs = self.device_sensor_rssi[dev_key]
                     result = _estimate_device_position(
-                        obs, self.sensors, tx, self.path_loss_exp)
+                        obs, self.sensors, tx, self.path_loss_exp,
+                        cal_offset=rssi_calibration_offset, gain_delta=gain_delta)
                     if result:
                         dd["est_lat"] = round(result[0], 6)
                         dd["est_lon"] = round(result[1], 6)
                         dd["est_unc"] = round(result[2], 1)
                         dd["num_sensors"] = result[3]
+                # Watch state
+                dd["is_watched"] = dev_key.lower() in self.watch_set
                 # Persistence fields
                 dd["is_new"] = False
                 dd["first_ever"] = None
@@ -1388,9 +1392,6 @@ class DashboardState:
                 dd["rpa_count"] = len(rpa_addrs) if rpa_addrs else 0
                 if rpa_addrs:
                     del dd["rpa_addrs"]
-                # Don't send internal accumulators or non-serializable objects
-                del dd["rssi_sum"]
-                del dd["rssi_cnt"]
                 dd.pop("_uap_est", None)
                 devs.append(dd)
             devs.sort(key=lambda x: x["last"], reverse=True)
@@ -1551,24 +1552,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
         else:
             self.send_error(404)
 
-    def do_POST(self):
-        path = urlparse(self.path).path
-        if path == "/api/watch":
-            try:
-                length = int(self.headers.get("Content-Length", 0))
-                body = json.loads(self.rfile.read(length))
-                mac = body.get("mac", "")
-                watch = body.get("watch", False)
-                if state.alert_mgr:
-                    if watch:
-                        state.alert_mgr.watch_set.add(mac.lower())
-                    else:
-                        state.alert_mgr.watch_set.discard(mac.lower())
-                self._serve_json({"ok": True})
-            except Exception:
-                self.send_error(400)
-        else:
-            self.send_error(404)
 
     def _serve_html(self):
         self.send_response(200)
@@ -1592,8 +1575,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         cols = ["mac", "protocol", "mac_type", "identity", "rpa_count",
                 "uap", "uap_conf", "mfr", "apple",
-                "name", "appear", "services", "type", "rssi", "rssi_min",
-                "rssi_avg", "tx_pwr", "est_dist", "num_sensors",
+                "name", "appear", "services", "type", "rssi",
+                "tx_pwr", "est_dist", "num_sensors",
                 "est_lat", "est_lon", "est_unc", "pkts", "crc_ok",
                 "crc_bad", "freq", "first", "last", "first_ever", "is_new"]
         self.wfile.write((",".join(cols) + "\n").encode())
@@ -1656,7 +1639,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
-        if path == "/api/control":
+        if path == "/api/watch":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length))
+                mac = body.get("mac", "").lower()
+                watch = body.get("watch", False)
+                if watch:
+                    state.watch_set.add(mac)
+                    if state.alert_mgr:
+                        state.alert_mgr.watch_set.add(mac)
+                else:
+                    state.watch_set.discard(mac)
+                    if state.alert_mgr:
+                        state.alert_mgr.watch_set.discard(mac)
+                self._serve_json({"ok": True, "watched": list(state.watch_set)})
+            except Exception:
+                self.send_error(400)
+        elif path == "/api/control":
             content_length = int(self.headers['Content-Length'])
             body = self.rfile.read(content_length).decode()
             try:
@@ -2308,40 +2308,24 @@ function mfrLabel(d) {
 }
 
 function rssiLabel(d) {
-  // Filter out invalid 0 values from each metric
-  const hasMin = d.rssi_min < 0;
-  const hasAvg = d.rssi_avg < 0;
-  const hasMax = d.rssi < 0;
+  if (d.rssi == null || d.rssi >= 0) return '<span class="dim">--</span>';
 
-  if (!hasMin && !hasAvg && !hasMax) return '<span class="dim">--</span>';
-
-  // Use average for signal strength classification
-  const primary = hasAvg ? d.rssi_avg : (hasMax ? d.rssi : d.rssi_min);
-
-  // Signal strength classification based on average
+  const v = d.rssi;
   let strength = 'poor', color = 'red';
-  if (primary >= -35) { strength = 'excellent'; color = 'grn'; }
-  else if (primary >= -45) { strength = 'good'; color = 'grn'; }
-  else if (primary >= -65) { strength = 'fair'; color = 'yel'; }
-  else if (primary >= -80) { strength = 'weak'; color = 'org'; }
+  if (v >= -35) { strength = 'excellent'; color = 'grn'; }
+  else if (v >= -45) { strength = 'good'; color = 'grn'; }
+  else if (v >= -65) { strength = 'fair'; color = 'yel'; }
+  else if (v >= -80) { strength = 'weak'; color = 'org'; }
 
-  // Build signal strength bar (5 levels with tighter thresholds)
   const bars = ['▁▁▁▁', '▂▁▁▁', '▂▄▁▁', '▂▄▆▁', '▂▄▆█'];
   let barIdx = 0;
-  if (primary >= -35) barIdx = 4;
-  else if (primary >= -45) barIdx = 3;
-  else if (primary >= -65) barIdx = 2;
-  else if (primary >= -80) barIdx = 1;
+  if (v >= -35) barIdx = 4;
+  else if (v >= -45) barIdx = 3;
+  else if (v >= -65) barIdx = 2;
+  else if (v >= -80) barIdx = 1;
 
-  // Format the three values with proper handling of missing data
-  const minStr = hasMin ? d.rssi_min : '--';
-  const avgStr = hasAvg ? d.rssi_avg : '--';
-  const maxStr = hasMax ? d.rssi : '--';
-
-  // Display: [bar] min/avg/max
-  const tooltip = `Signal Strength: ${strength}\nMin: ${minStr} dBm\nAvg: ${avgStr} dBm\nMax: ${maxStr} dBm`;
-
-  return `<span class="${color}" title="${tooltip}" style="cursor:help;white-space:nowrap">${bars[barIdx]} ${minStr}/${avgStr}/${maxStr}</span>`;
+  const tooltip = `Signal (EMA): ${v} dBm\nStrength: ${strength}`;
+  return `<span class="${color}" title="${tooltip}" style="cursor:help;white-space:nowrap">${bars[barIdx]} ${v}</span>`;
 }
 
 function svcLabel(d) {
@@ -2613,12 +2597,11 @@ const es = new EventSource('/events');
 const cn = document.getElementById('conn');
 es.onopen = ()=>{ cn.textContent='connected'; cn.className='status ok'; };
 es.onerror = ()=>{ cn.textContent='disconnected'; cn.className='status'; };
-// Alerting: notification permission + watched devices
-if ('Notification' in window && Notification.permission === 'default') {
-  Notification.requestPermission();
-}
 const watched = new Set();
 function toggleWatch(mac) {
+  if ('Notification' in window && Notification.permission === 'default') {
+    Notification.requestPermission();
+  }
   if (watched.has(mac)) watched.delete(mac);
   else watched.add(mac);
   renderDevices();
@@ -2633,6 +2616,9 @@ es.addEventListener('update', e => {
   const d = JSON.parse(e.data);
   devices = d.devices;
   summary = d.summary;
+  // Sync watch state from server — source of truth for persistence across refreshes
+  watched.clear();
+  for (const dev of devices) { if (dev.is_watched) watched.add(dev.mac); }
   updStats(d.stats);
   renderDevices();
   if (curTab === 'summary') renderSummary(summary);

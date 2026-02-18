@@ -364,7 +364,9 @@ ble_packet_t *ble_burst(uint8_t *bits, unsigned bits_len, unsigned freq, struct 
 void bluetooth_detect(uint8_t *bits, unsigned len, float *demod, unsigned demod_len,
                       unsigned silence_offset, unsigned freq, float rssi, float noise, 
                       struct timespec timestamp, uint32_t *lap_out, uint32_t *aa_out) {
-    uint32_t lap = btbb_find_ac((char *)bits, len, 1);
+    int ac_offset = 0;
+    uint8_t ac_errors = 0;
+    uint32_t lap = btbb_find_ac_offset((char *)bits, len, 1, &ac_offset, &ac_errors);
     if (lap != 0xffffffff) {
         *lap_out = lap;
 
