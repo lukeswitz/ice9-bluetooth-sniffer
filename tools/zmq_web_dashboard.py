@@ -105,6 +105,14 @@ class DeviceDB:
                 );
                 CREATE INDEX IF NOT EXISTS idx_devices_last_seen
                     ON devices(last_seen);
+                CREATE TABLE IF NOT EXISTS alert_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS watch_list (
+                    mac TEXT PRIMARY KEY,
+                    added_at REAL NOT NULL
+                );
             """)
 
     def _start_session(self):
@@ -153,6 +161,47 @@ class DeviceDB:
         row = cur.fetchone()
         return row[0] if row else None
 
+    def load_alert_settings(self):
+        cur = self.conn.execute("SELECT key, value FROM alert_settings")
+        raw = dict(cur.fetchall())
+        settings = {}
+        if "webhook_url" in raw:
+            settings["webhook_url"] = raw["webhook_url"] or None
+        if "alert_cmd" in raw:
+            settings["alert_cmd"] = raw["alert_cmd"] or None
+        for bool_key in ("alert_new", "notify_left", "notify_returned"):
+            if bool_key in raw:
+                settings[bool_key] = raw[bool_key] == "1"
+        for int_key in ("cooldown", "absence_threshold"):
+            if int_key in raw:
+                settings[int_key] = int(raw[int_key])
+        return settings
+
+    def save_alert_setting(self, key, value):
+        with self.lock:
+            self.conn.execute(
+                "INSERT INTO alert_settings (key, value) VALUES (?, ?)"
+                " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, str(value) if value is not None else ""))
+            self.conn.commit()
+
+    def load_watch_list(self):
+        cur = self.conn.execute("SELECT mac FROM watch_list")
+        return {row[0] for row in cur.fetchall()}
+
+    def add_watch_entry(self, mac):
+        with self.lock:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO watch_list (mac, added_at) VALUES (?, ?)",
+                (mac.lower(), time.time()))
+            self.conn.commit()
+
+    def remove_watch_entry(self, mac):
+        with self.lock:
+            self.conn.execute(
+                "DELETE FROM watch_list WHERE mac = ?", (mac.lower(),))
+            self.conn.commit()
+
     def close(self):
         with self.lock:
             self.conn.execute(
@@ -169,19 +218,51 @@ class AlertManager:
     """Device alerting via shell commands, webhooks, and browser notifications."""
 
     def __init__(self, watch_file=None, alert_cmd=None, alert_new=False,
-                 webhook_url=None, cooldown=300, db=None):
+                 webhook_url=None, cooldown=300, db=None,
+                 notify_left=False, notify_returned=False, absence_threshold=60):
         self.watch_set = set()
         self.alert_cmd = alert_cmd
         self.alert_new = alert_new
         self.webhook_url = webhook_url
         self.cooldown = cooldown
+        self.notify_left = notify_left
+        self.notify_returned = notify_returned
+        self.absence_threshold = absence_threshold
         self.db = db
         self.last_alert = {}
+        # presence_state: dev_key -> {present, last_seen, alerted_left, device_info}
+        self.presence_state = {}
         self.lock = threading.Lock()
         self.pending_browser_alerts = []
+        self.alert_log = []  # persistent rolling log, never cleared
 
+        if db:
+            self._load_defaults_from_db(db)
         if watch_file:
             self._load_watch_file(watch_file)
+
+        self._monitor = threading.Thread(target=self._presence_monitor, daemon=True)
+        self._monitor.start()
+
+    def _load_defaults_from_db(self, db):
+        """Fill in settings from DB for values not provided via CLI args."""
+        s = db.load_alert_settings()
+        if not self.webhook_url:
+            self.webhook_url = s.get("webhook_url")
+        if not self.alert_cmd:
+            self.alert_cmd = s.get("alert_cmd")
+        if not self.alert_new:
+            self.alert_new = s.get("alert_new", False)
+        if self.cooldown == 300 and "cooldown" in s:
+            self.cooldown = s["cooldown"]
+        if not self.notify_left:
+            self.notify_left = s.get("notify_left", False)
+        if not self.notify_returned:
+            self.notify_returned = s.get("notify_returned", False)
+        if self.absence_threshold == 60 and "absence_threshold" in s:
+            self.absence_threshold = s["absence_threshold"]
+        # Restore persisted watch list
+        self.watch_set.update(db.load_watch_list())
 
     def _load_watch_file(self, path):
         with open(path) as f:
@@ -195,35 +276,60 @@ class AlertManager:
 
     def check(self, dev_key, device_info):
         now = time.time()
+        to_fire = []
+
+        is_watched = dev_key.lower() in self.watch_set
+        if not is_watched and device_info.get("identity"):
+            if f"[{device_info['identity']}]".lower() in self.watch_set:
+                is_watched = True
 
         with self.lock:
-            if dev_key in self.last_alert:
-                if now - self.last_alert[dev_key] < self.cooldown:
-                    return
+            if is_watched:
+                ps = self.presence_state.get(dev_key)
+                if ps is None:
+                    # First time seeing this watched device — just initialize
+                    self.presence_state[dev_key] = {
+                        "present": True, "last_seen": now,
+                        "alerted_left": False, "device_info": dict(device_info),
+                    }
+                else:
+                    was_present = ps["present"]
+                    ps["present"] = True
+                    ps["last_seen"] = now
+                    ps["alerted_left"] = False
+                    ps["device_info"] = dict(device_info)
+                    if not was_present and self.notify_returned:
+                        alert_key = dev_key + ":returned"
+                        if now - self.last_alert.get(alert_key, 0) > self.cooldown:
+                            self.last_alert[alert_key] = now
+                            to_fire.append("device-returned")
 
-            should_alert = False
-            alert_reason = ""
+            if self.alert_new and self.db and self.db.is_new(dev_key):
+                alert_key = dev_key + ":new"
+                if now - self.last_alert.get(alert_key, 0) > self.cooldown:
+                    self.last_alert[alert_key] = now
+                    to_fire.append("new-device")
 
-            if dev_key.lower() in self.watch_set:
-                should_alert = True
-                alert_reason = "watchlist"
-            elif device_info.get("identity"):
-                label = f"[{device_info['identity']}]"
-                if label.lower() in self.watch_set:
-                    should_alert = True
-                    alert_reason = "watchlist-identity"
+        for reason in to_fire:
+            self._fire_alert(dev_key, device_info, reason)
 
-            if not should_alert and self.alert_new and self.db:
-                if self.db.is_new(dev_key):
-                    should_alert = True
-                    alert_reason = "new-device"
-
-            if not should_alert:
-                return
-
-            self.last_alert[dev_key] = now
-
-        self._fire_alert(dev_key, device_info, alert_reason)
+    def _presence_monitor(self):
+        """Background thread: fires device-left when a watched device goes silent."""
+        while True:
+            time.sleep(5)
+            now = time.time()
+            to_fire = []
+            with self.lock:
+                if not self.notify_left:
+                    continue
+                for dev_key, ps in list(self.presence_state.items()):
+                    if (ps["present"] and not ps["alerted_left"]
+                            and (now - ps["last_seen"]) > self.absence_threshold):
+                        ps["present"] = False
+                        ps["alerted_left"] = True
+                        to_fire.append((dev_key, dict(ps["device_info"])))
+            for dev_key, info in to_fire:
+                self._fire_alert(dev_key, info, "device-left")
 
     def _fire_alert(self, dev_key, device_info, reason):
         alert_data = {
@@ -247,6 +353,9 @@ class AlertManager:
             self.pending_browser_alerts.append(alert_data)
             if len(self.pending_browser_alerts) > 100:
                 self.pending_browser_alerts = self.pending_browser_alerts[-100:]
+            self.alert_log.append(alert_data)
+            if len(self.alert_log) > 200:
+                self.alert_log = self.alert_log[-200:]
 
     def _exec_cmd(self, alert_data):
         env = os.environ.copy()
@@ -267,10 +376,28 @@ class AlertManager:
     def _send_webhook(self, alert_data):
         import urllib.request
         try:
-            data = json.dumps(alert_data).encode()
-            req = urllib.request.Request(
-                self.webhook_url, data=data,
-                headers={"Content-Type": "application/json"})
+            url = self.webhook_url
+            if "ntfy.sh" in url:
+                # ntfy.sh expects message/title/priority/tags fields
+                label = alert_data.get("name") or alert_data.get("mfr") or ""
+                msg = alert_data["mac"]
+                if label:
+                    msg += f" — {label}"
+                msg += f" ({alert_data['protocol']}, RSSI: {alert_data['rssi']})"
+                title = ("New Device" if alert_data["reason"] == "new-device"
+                         else "Watched Device")
+                payload = json.dumps({
+                    "message": msg, "title": title,
+                    "priority": 4, "tags": ["rotating_light"],
+                }).encode()
+                req = urllib.request.Request(
+                    url, data=payload,
+                    headers={"Content-Type": "application/json"})
+            else:
+                payload = json.dumps(alert_data).encode()
+                req = urllib.request.Request(
+                    url, data=payload,
+                    headers={"Content-Type": "application/json"})
             urllib.request.urlopen(req, timeout=5)
         except Exception as e:
             print(f"  Webhook failed: {e}", file=sys.stderr)
@@ -280,6 +407,10 @@ class AlertManager:
             alerts = list(self.pending_browser_alerts)
             self.pending_browser_alerts.clear()
             return alerts
+
+    def get_alert_log(self):
+        with self.lock:
+            return list(reversed(self.alert_log))  # newest first
 
 
 # ---------------------------------------------------------------------------
@@ -1549,6 +1680,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._serve_csv()
         elif path == "/api/export.json":
             self._serve_export_json()
+        elif path == "/api/alert-settings":
+            mgr = state.alert_mgr
+            self._serve_json({
+                "alert_new": mgr.alert_new,
+                "notify_left": mgr.notify_left,
+                "notify_returned": mgr.notify_returned,
+                "absence_threshold": mgr.absence_threshold,
+                "cooldown": mgr.cooldown,
+                "webhook_url": mgr.webhook_url or "",
+                "alert_cmd": mgr.alert_cmd or "",
+                "watch_list": sorted(mgr.watch_set),
+                "log": mgr.get_alert_log(),
+            })
         else:
             self.send_error(404)
 
@@ -1647,15 +1791,63 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 watch = body.get("watch", False)
                 if watch:
                     state.watch_set.add(mac)
-                    if state.alert_mgr:
-                        state.alert_mgr.watch_set.add(mac)
+                    state.alert_mgr.watch_set.add(mac)
+                    if state.db:
+                        state.db.add_watch_entry(mac)
                 else:
                     state.watch_set.discard(mac)
-                    if state.alert_mgr:
-                        state.alert_mgr.watch_set.discard(mac)
+                    state.alert_mgr.watch_set.discard(mac)
+                    if state.db:
+                        state.db.remove_watch_entry(mac)
                 self._serve_json({"ok": True, "watched": list(state.watch_set)})
             except Exception:
                 self.send_error(400)
+        elif path == "/api/alert-settings":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length))
+                mgr = state.alert_mgr
+                bool_fields = {
+                    "alert_new": "alert_new",
+                    "notify_left": "notify_left",
+                    "notify_returned": "notify_returned",
+                }
+                for key, attr in bool_fields.items():
+                    if key in body:
+                        setattr(mgr, attr, bool(body[key]))
+                        if state.db:
+                            state.db.save_alert_setting(key, int(getattr(mgr, attr)))
+                if "cooldown" in body:
+                    mgr.cooldown = max(0, int(body["cooldown"]))
+                    if state.db:
+                        state.db.save_alert_setting("cooldown", mgr.cooldown)
+                if "absence_threshold" in body:
+                    mgr.absence_threshold = max(5, int(body["absence_threshold"]))
+                    if state.db:
+                        state.db.save_alert_setting("absence_threshold",
+                                                     mgr.absence_threshold)
+                if "webhook_url" in body:
+                    mgr.webhook_url = body["webhook_url"].strip() or None
+                    if state.db:
+                        state.db.save_alert_setting("webhook_url", mgr.webhook_url or "")
+                if "alert_cmd" in body:
+                    mgr.alert_cmd = body["alert_cmd"].strip() or None
+                    if state.db:
+                        state.db.save_alert_setting("alert_cmd", mgr.alert_cmd or "")
+                self._serve_json({"ok": True})
+            except Exception:
+                self.send_error(400)
+        elif path == "/api/alert-test":
+            try:
+                state.alert_mgr._fire_alert(
+                    "ff:ff:ff:ff:ff:ff",
+                    {"name": "Test Alert", "mfr": "ice9-bluetooth",
+                     "rssi": -55, "protocol": "BLE", "identity": None},
+                    "test",
+                )
+                self._serve_json({"ok": True})
+            except Exception as e:
+                self._serve_json({"ok": False, "error": str(e)})
         elif path == "/api/control":
             content_length = int(self.headers['Content-Length'])
             body = self.rfile.read(content_length).decode()
@@ -2043,6 +2235,7 @@ td[data-col="rssi"] { font-family: 'Menlo', 'Monaco', 'Courier New', monospace; 
     <div class="tab active" data-tab="devices" onclick="switchTab('devices')">devices</div>
     <div class="tab" data-tab="summary" onclick="switchTab('summary')">summary</div>
     <div class="tab" data-tab="sdr" onclick="switchTab('sdr')">sdr</div>
+    <div class="tab" data-tab="alerts" onclick="switchTab('alerts')">alerts</div>
   </div>
   <select class="filter" id="protoFilter" onchange="renderDevices()" title="Protocol filter">
     <option value="all">all</option>
@@ -2149,12 +2342,24 @@ td[data-col="rssi"] { font-family: 'Menlo', 'Monaco', 'Courier New', monospace; 
   </div>
 </div>
 
+<div class="panel" id="panelAlerts">
+  <div style="padding:20px;max-width:760px;">
+    <h3 style="margin-bottom:12px;color:#ccc;">Alert Settings</h3>
+    <div id="alertSettingsArea" style="font-size:11px;color:#666;">Loading...</div>
+    <h3 style="margin:20px 0 10px;color:#ccc;">Watched Devices</h3>
+    <div id="watchListArea" style="font-size:11px;"></div>
+    <h3 style="margin:20px 0 10px;color:#ccc;">Alert Log <span id="alertLogCount" style="font-size:10px;color:#666;font-weight:normal;"></span></h3>
+    <div id="alertLogArea" style="font-size:11px;"></div>
+  </div>
+</div>
+
 <script>
 let priv = true, map = null, marker = null, trail = [], curTab = 'devices';
 let sortCol = 'last', sortAsc = false;
 const GPS = __GPS_ENABLED__;
 const tb = document.getElementById('tb');
 let devices = [], summary = null;
+let alertLog = [], alertSettings = {active: false, alert_new: false, cooldown: 300};
 
 function switchTab(name) {
   curTab = name;
@@ -2163,6 +2368,250 @@ function switchTab(name) {
   document.getElementById('panel'+name.charAt(0).toUpperCase()+name.slice(1)).classList.add('active');
   if (name === 'map' && map) map.invalidateSize();
   if (name === 'summary' && summary) renderSummary(summary);
+  if (name === 'alerts') loadAlertSettings();
+}
+
+const _BTN = 'cursor:pointer;background:#333;color:#ccc;border:1px solid #555;border-radius:3px;padding:3px 10px;font-size:11px;';
+const _BTN_ON = 'cursor:pointer;background:#2a4a2a;color:#ccc;border:1px solid #555;border-radius:3px;padding:3px 10px;font-size:11px;';
+const _CARD = 'background:#202020;border:1px solid #333;padding:12px;margin-bottom:10px;';
+const _INPUT = 'background:#2a2a2a;color:#ccc;border:1px solid #555;padding:4px 8px;font:11px monospace;';
+const _LABEL = 'display:block;color:#888;font-size:10px;margin-bottom:4px;';
+
+function _esc(v) { return String(v||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;'); }
+
+function postAlertSettings(patch) {
+  return fetch('/api/alert-settings', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(patch)
+  }).then(r => r.json());
+}
+
+function loadAlertSettings() {
+  fetch('/api/alert-settings').then(r => r.json()).then(s => {
+    alertSettings = s;
+    const existing = new Set(alertLog.map(a => a.timestamp + a.mac));
+    const merged = [...alertLog];
+    for (const a of (s.log || [])) {
+      if (!existing.has(a.timestamp + a.mac)) merged.push(a);
+    }
+    merged.sort((a, b) => b.timestamp - a.timestamp);
+    alertLog = merged.slice(0, 200);
+    renderAlertSettings(s);
+    renderWatchList(s.watch_list || []);
+    renderAlertLog();
+  }).catch(() => {
+    document.getElementById('alertSettingsArea').textContent = 'Failed to load.';
+  });
+}
+
+function renderAlertSettings(s) {
+  const el = document.getElementById('alertSettingsArea');
+  const notifStatus = () => {
+    if (!('Notification' in window)) return '<span style="color:#666;">not supported</span>';
+    const p = Notification.permission;
+    if (p === 'granted') return '<span style="color:#4a4;">granted</span>';
+    if (p === 'denied') return '<span style="color:#a44;">denied — enable in browser settings</span>';
+    return '<button onclick="Notification.requestPermission().then(loadAlertSettings)" style="'+_BTN+'">Request permission</button>';
+  };
+  el.innerHTML =
+    '<div style="'+_CARD+'">'
+    + '<div style="color:#aaa;margin-bottom:10px;font-size:12px;">Webhook / ntfy.sh</div>'
+    + '<div style="display:flex;gap:8px;">'
+    + '<input id="cfgWebhook" type="url" placeholder="https://ntfy.sh/your-topic" value="'+_esc(s.webhook_url)+'" style="'+_INPUT+';flex:1;">'
+    + '<button onclick="saveWebhook()" style="'+_BTN+'">save</button>'
+    + '<button id="alertTestBtn" onclick="testAlert()" style="'+_BTN+'">test</button>'
+    + '</div>'
+    + '<div style="color:#555;font-size:10px;margin-top:5px;">'
+    + 'ntfy.sh: use <code>https://ntfy.sh/your-topic</code> — sends push to all your subscribed devices. '
+    + 'Generic: receives JSON {mac, name, mfr, rssi, protocol, reason, timestamp}.'
+    + '</div></div>'
+
+    + '<div style="'+_CARD+'">'
+    + '<div style="color:#aaa;margin-bottom:6px;font-size:12px;">Local Script <span style="color:#555;font-weight:normal;">'
+    + '— runs on this machine when an alert fires</span></div>'
+    + '<div style="display:flex;gap:8px;margin-bottom:6px;">'
+    + '<input id="cfgCmd" type="text" placeholder="e.g.: notify-send &quot;BT device arrived&quot;" value="'+_esc(s.alert_cmd)+'" style="'+_INPUT+';flex:1;">'
+    + '<button onclick="saveAlertCmd()" style="'+_BTN+'">save</button>'
+    + '</div>'
+    + '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px;">'
+    + '<span style="color:#555;font-size:10px;align-self:center;">Examples:</span>'
+    + '<button onclick="document.getElementById(\'cfgCmd\').value=\'notify-send &quot;BT: $ALERT_NAME ($ALERT_REASON)&quot;\'" style="'+_BTN+';font-size:10px;padding:1px 7px;">Linux desktop notify</button>'
+    + '<button onclick="document.getElementById(\'cfgCmd\').value=\'echo &quot;$(date) $ALERT_REASON $ALERT_MAC $ALERT_NAME&quot; >> ~/bt-alerts.log\'" style="'+_BTN+';font-size:10px;padding:1px 7px;">Log to file</button>'
+    + '<button onclick="document.getElementById(\'cfgCmd\').value=\'osascript -e &quot;display notification \\&quot;$ALERT_NAME\\&quot; with title \\&quot;BT Alert\\&quot;&quot;\'" style="'+_BTN+';font-size:10px;padding:1px 7px;">macOS notification</button>'
+    + '</div>'
+    + '<details style="font-size:10px;color:#555;margin-top:4px;">'
+    + '<summary style="cursor:pointer;color:#666;">Available variables</summary>'
+    + '<div style="margin-top:4px;line-height:1.8;">'
+    + '<code>$ALERT_MAC</code> device address &nbsp; <code>$ALERT_NAME</code> advertised name &nbsp; '
+    + '<code>$ALERT_REASON</code> new-device / device-left / device-returned &nbsp; '
+    + '<code>$ALERT_RSSI</code> signal strength &nbsp; <code>$ALERT_MFR</code> manufacturer &nbsp; '
+    + '<code>$ALERT_PROTOCOL</code> BLE or BT'
+    + '</div></details>'
+    + '</div>'
+
+    + '<div style="'+_CARD+'">'
+    + '<div style="color:#aaa;margin-bottom:12px;font-size:12px;">Notifications — what triggers an alert?</div>'
+    + '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;">'
+
+    + '<div style="border:1px solid #333;padding:10px;">'
+    + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">'
+    + '<span style="color:#ccc;">New Device</span>'
+    + '<button id="alertNewBtn" onclick="toggleBool(\'alert_new\')" style="'+(s.alert_new?_BTN_ON:_BTN)+'">'+(s.alert_new?'ON':'OFF')+'</button>'
+    + '</div>'
+    + '<div style="color:#555;font-size:10px;">Fires the first time any device is ever seen. Good for passive discovery.</div>'
+    + '</div>'
+
+    + '<div style="border:1px solid #333;padding:10px;">'
+    + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">'
+    + '<span style="color:#ccc;">Device Left</span>'
+    + '<button id="notifyLeftBtn" onclick="toggleBool(\'notify_left\')" style="'+(s.notify_left?_BTN_ON:_BTN)+'">'+(s.notify_left?'ON':'OFF')+'</button>'
+    + '</div>'
+    + '<div style="color:#555;font-size:10px;margin-bottom:8px;">Fires when a <strong style="color:#888;">watched</strong> device disappears from scanning for longer than the absence window.</div>'
+    + '<div style="display:flex;align-items:center;gap:6px;font-size:10px;color:#888;">'
+    + 'Absence window: <input id="absenceThreshold" type="number" min="5" max="3600" value="'+s.absence_threshold+'" style="'+_INPUT+';width:52px;">'
+    + '<span style="color:#555;">s</span>'
+    + '<button onclick="saveAbsenceThreshold()" style="'+_BTN+';font-size:10px;padding:2px 6px;">save</button>'
+    + '</div></div>'
+
+    + '<div style="border:1px solid #333;padding:10px;">'
+    + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">'
+    + '<span style="color:#ccc;">Device Returned</span>'
+    + '<button id="notifyReturnedBtn" onclick="toggleBool(\'notify_returned\')" style="'+(s.notify_returned?_BTN_ON:_BTN)+'">'+(s.notify_returned?'ON':'OFF')+'</button>'
+    + '</div>'
+    + '<div style="color:#555;font-size:10px;">Fires when a <strong style="color:#888;">watched</strong> device is seen again after having left.</div>'
+    + '</div>'
+
+    + '</div>'
+    + '<div style="margin-top:10px;display:flex;align-items:center;gap:16px;">'
+    + '<div style="color:#555;font-size:10px;">Re-alert cooldown: <input id="alertCooldown" type="number" min="0" max="86400" value="'+s.cooldown+'" style="'+_INPUT+';width:60px;"> s <button onclick="saveCooldown()" style="'+_BTN+';font-size:10px;padding:2px 6px;">save</button></div>'
+    + '<div style="font-size:10px;">Browser: ' + notifStatus() + '</div>'
+    + '</div></div>';
+}
+
+function saveWebhook() {
+  const url = document.getElementById('cfgWebhook').value.trim();
+  postAlertSettings({webhook_url: url}).then(() => { alertSettings.webhook_url = url; });
+}
+
+function saveAlertCmd() {
+  const cmd = document.getElementById('cfgCmd').value.trim();
+  postAlertSettings({alert_cmd: cmd}).then(() => { alertSettings.alert_cmd = cmd; });
+}
+
+function testAlert() {
+  const btn = document.getElementById('alertTestBtn');
+  if (btn) { btn.textContent = '...'; btn.disabled = true; }
+  fetch('/api/alert-test', {method:'POST'}).then(r => r.json()).then(r => {
+    if (btn) { btn.textContent = r.ok ? 'sent!' : 'failed'; btn.disabled = false; }
+    setTimeout(() => { if (btn) btn.textContent = 'test'; }, 2000);
+  }).catch(() => { if (btn) { btn.textContent = 'error'; btn.disabled = false; } });
+}
+
+const _BOOL_BTNS = {
+  alert_new: 'alertNewBtn',
+  notify_left: 'notifyLeftBtn',
+  notify_returned: 'notifyReturnedBtn',
+};
+function toggleBool(key) {
+  const v = !alertSettings[key];
+  postAlertSettings({[key]: v}).then(() => {
+    alertSettings[key] = v;
+    const btn = document.getElementById(_BOOL_BTNS[key]);
+    if (btn) { btn.style.cssText = v ? _BTN_ON : _BTN; btn.textContent = v ? 'ON' : 'OFF'; }
+  });
+}
+
+function saveCooldown() {
+  const v = parseInt(document.getElementById('alertCooldown').value, 10);
+  if (!isNaN(v) && v >= 0) postAlertSettings({cooldown: v}).then(() => { alertSettings.cooldown = v; });
+}
+
+function saveAbsenceThreshold() {
+  const v = parseInt(document.getElementById('absenceThreshold').value, 10);
+  if (!isNaN(v) && v >= 5)
+    postAlertSettings({absence_threshold: v}).then(() => { alertSettings.absence_threshold = v; });
+}
+
+function renderWatchList(list) {
+  const el = document.getElementById('watchListArea');
+  if (!el) return;
+  let html = '<div style="'+_CARD+'">'
+    + '<div style="display:flex;gap:8px;margin-bottom:10px;">'
+    + '<input id="watchAddInput" type="text" placeholder="MAC address (aa:bb:cc:dd:ee:ff)" style="'+_INPUT+';flex:1;">'
+    + '<button onclick="addWatchEntry()" style="'+_BTN+'">add</button>'
+    + '</div>';
+  if (!list.length) {
+    html += '<div style="color:#555;padding:4px 0;">No devices watched. Use the watch button in the devices tab or add a MAC above.</div>';
+  } else {
+    html += '<table style="width:100%;border-collapse:collapse;">';
+    for (const mac of list) {
+      const dev = devices.find(d => d.mac && d.mac.toLowerCase() === mac.toLowerCase());
+      const info = dev ? ([dev.name, dev.mfr].filter(Boolean).join(' / ') || '') : '';
+      html += '<tr style="border-bottom:1px solid #1e1e1e;">'
+        + '<td style="padding:3px 8px;font-family:monospace;font-size:10px;">'+(priv?mask(mac):mac)+'</td>'
+        + '<td style="padding:3px 8px;color:#888;">'+info+'</td>'
+        + '<td style="padding:3px 8px;text-align:right;">'
+        + '<button onclick="removeWatchEntry(\''+mac.replace(/'/g,"\\'")+'\')" style="'+_BTN+';color:#a66;">remove</button>'
+        + '</td></tr>';
+    }
+    html += '</table>';
+  }
+  html += '</div>';
+  el.innerHTML = html;
+}
+
+function addWatchEntry() {
+  const mac = (document.getElementById('watchAddInput').value || '').trim().toLowerCase();
+  if (!mac) return;
+  fetch('/api/watch', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({mac: mac, watch: true})
+  }).then(() => loadAlertSettings()).catch(() => {});
+}
+
+function removeWatchEntry(mac) {
+  fetch('/api/watch', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({mac: mac, watch: false})
+  }).then(() => loadAlertSettings()).catch(() => {});
+}
+
+function renderAlertLog() {
+  const el = document.getElementById('alertLogArea');
+  const cntEl = document.getElementById('alertLogCount');
+  if (!el) return;
+  if (cntEl) cntEl.textContent = alertLog.length ? `(${alertLog.length})` : '';
+  if (!alertLog.length) {
+    el.innerHTML = '<div class="dim" style="padding:8px">no alerts yet</div>';
+    return;
+  }
+  let html = '<table style="width:100%;border-collapse:collapse;">'
+    + '<thead><tr style="color:#888;border-bottom:1px solid #333;">'
+    + '<th style="text-align:left;padding:3px 8px;font-weight:normal;">time</th>'
+    + '<th style="text-align:left;padding:3px 8px;font-weight:normal;">MAC</th>'
+    + '<th style="text-align:left;padding:3px 8px;font-weight:normal;">name/mfr</th>'
+    + '<th style="text-align:left;padding:3px 8px;font-weight:normal;">reason</th>'
+    + '<th style="text-align:left;padding:3px 8px;font-weight:normal;">RSSI</th>'
+    + '</tr></thead><tbody>';
+  const _rStyle = {'new-device':'color:#68f','device-left':'color:#a44','device-returned':'color:#4a4','test':'color:#666'};
+  const _rLabel = {'new-device':'new device','device-left':'left range','device-returned':'returned','test':'test'};
+  for (const a of alertLog) {
+    const ts = new Date(a.timestamp * 1000).toLocaleTimeString();
+    const mac = priv ? mask(a.mac) : a.mac;
+    const info = [a.name, a.mfr].filter(Boolean).join(' / ') || '';
+    const rssi = (a.rssi != null && a.rssi < 0) ? a.rssi + ' dBm' : '';
+    const rstyle = _rStyle[a.reason] || 'color:#ca6';
+    const rlabel = _rLabel[a.reason] || a.reason;
+    html += `<tr style="border-bottom:1px solid #1e1e1e;">`
+      + `<td style="padding:3px 8px;color:#666;">${ts}</td>`
+      + `<td style="padding:3px 8px;font-family:monospace;font-size:10px;">${mac}</td>`
+      + `<td style="padding:3px 8px;color:#aaa;">${info}</td>`
+      + `<td style="padding:3px 8px;${rstyle};">${rlabel}</td>`
+      + `<td style="padding:3px 8px;color:#888;">${rssi}</td>`
+      + `</tr>`;
+  }
+  html += '</tbody></table>';
+  el.innerHTML = html;
 }
 
 function togglePrivacy() {
@@ -2636,8 +3085,13 @@ es.addEventListener('update', e => {
   if (devices && map) updateDevicePositions(devices);
   // Browser alerts
   if (d.alerts && d.alerts.length > 0) {
+    // Prepend new alerts to log (newest first)
+    alertLog = [...d.alerts, ...alertLog].slice(0, 200);
+    if (curTab === 'alerts') renderAlertLog();
     for (const a of d.alerts) {
-      const title = a.reason === 'new-device' ? 'New Device' : 'Watched Device';
+      const title = a.reason === 'new-device' ? 'New Device'
+        : a.reason === 'device-left' ? 'Device Left'
+        : a.reason === 'device-returned' ? 'Device Returned' : 'BT Alert';
       const body = a.mac + ' ' + (a.name||'') + ' (' + a.protocol + ', RSSI: ' + a.rssi + ')';
       if ('Notification' in window && Notification.permission === 'granted') {
         new Notification(title, { body: body, tag: a.mac });
@@ -2739,19 +3193,20 @@ def main():
         db_path = args.db or DeviceDB.DEFAULT_PATH
         state.db = DeviceDB(db_path)
 
-    # Device alerting
-    if args.alert_file or args.alert_new or args.alert_cmd or args.alert_webhook:
-        state.alert_mgr = AlertManager(
-            watch_file=args.alert_file,
-            alert_cmd=args.alert_cmd,
-            alert_new=args.alert_new,
-            webhook_url=args.alert_webhook,
-            cooldown=args.alert_cooldown,
-            db=state.db,
-        )
-        if args.alert_new and not state.db:
-            print("  Warning: --alert-new requires database (remove --no-db)",
-                  file=sys.stderr)
+    # Device alerting — always created so UI can configure it at runtime
+    state.alert_mgr = AlertManager(
+        watch_file=args.alert_file,
+        alert_cmd=args.alert_cmd,
+        alert_new=args.alert_new,
+        webhook_url=args.alert_webhook,
+        cooldown=args.alert_cooldown,
+        db=state.db,
+    )
+    if args.alert_new and not state.db:
+        print("  Warning: --alert-new requires database (remove --no-db)",
+              file=sys.stderr)
+    # Sync state.watch_set from the alert manager's loaded watch set (includes DB entries)
+    state.watch_set = set(state.alert_mgr.watch_set)
 
     def sig_handler(sig, frame):
         global running
