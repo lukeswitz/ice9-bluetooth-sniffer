@@ -8,5 +8,7 @@ build/
 *.key
 *.key.pub
 .DS_Store
-
+*.db
+*.pcap
+__pycache__/
 default.metallib

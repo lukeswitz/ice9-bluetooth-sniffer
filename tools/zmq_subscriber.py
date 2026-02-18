@@ -298,6 +298,10 @@ def main():
         else:
             pcap_data = frames[-1]
 
+        # Strip type prefix byte if present (0x00=BLE, 0x01=BT)
+        if len(pcap_data) > PCAP_REC_HDR.size and pcap_data[0] <= 0x01:
+            pcap_data = pcap_data[1:]
+
         # Write to PCAP file
         if pcap_file:
             if args.gps:

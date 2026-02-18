@@ -21,6 +21,7 @@ Optional arguments:
     -X, --zmq-connect=ENDPOINT  publish via ZMQ PUB connect (collector mode)
     -K, --zmq-curve-key=FILE  enable CURVE encryption using key file
     -G, --gpsd              tag packets with GPS coordinates from gpsd
+        --sensor-id=NAME    sensor identity for multi-sensor deployments
 
 GPU acceleration:
     When built with OpenCL support, the polyphase filterbank channelizer and

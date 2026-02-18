@@ -245,3 +245,19 @@ uint32_t btbb_find_ac(char *stream, int search_length,
 
     return 0xffffffff;
 }
+
+/* Find AC and return bit offset + error count (for header extraction) */
+uint32_t btbb_find_ac_offset(char *stream, int search_length,
+                              int max_ac_errors, int *offset_out,
+                              uint8_t *ac_errors_out) {
+    uint32_t lap;
+    uint8_t ac_errors;
+    int offset = promiscuous_packet_search(stream, search_length, &lap,
+                                            max_ac_errors, &ac_errors);
+    if (offset >= 0) {
+        if (offset_out) *offset_out = offset;
+        if (ac_errors_out) *ac_errors_out = ac_errors;
+        return lap;
+    }
+    return 0xffffffff;
+}

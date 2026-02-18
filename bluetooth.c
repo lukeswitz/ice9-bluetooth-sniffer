@@ -367,6 +367,31 @@ void bluetooth_detect(uint8_t *bits, unsigned len, float *demod, unsigned demod_
     uint32_t lap = btbb_find_ac((char *)bits, len, 1);
     if (lap != 0xffffffff) {
         *lap_out = lap;
+
+        // Build Classic BT packet for PCAP/ZMQ
+        classic_bt_packet_t bt_pkt = {0};
+        bt_pkt.lap = lap;
+        bt_pkt.ac_errors = ac_errors;
+        bt_pkt.rssi_db = rssi;
+        bt_pkt.noise_db = noise;
+        bt_pkt.freq = freq;
+        bt_pkt.timestamp = timestamp;
+
+        // Extract 54 raw header bits after the 64-bit sync word
+        unsigned header_start = ac_offset + 64;
+        if (header_start + 54 <= len) {
+            bt_pkt.has_header = 1;
+            memset(bt_pkt.raw_header, 0, sizeof(bt_pkt.raw_header));
+            for (unsigned i = 0; i < 54; i++)
+                bt_pkt.raw_header[i / 8] |= (bits[header_start + i] & 1) << (i % 8);
+        }
+
+        if (pcap
+#ifdef HAVE_ZMQ
+            || zmq_pub_active
+#endif
+        )
+            pcap_write_bt(pcap, &bt_pkt);
     } else {
         // Apply RSSI calibration
         float calibrated_rssi = rssi + rssi_calibration_offset;

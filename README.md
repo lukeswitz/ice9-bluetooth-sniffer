@@ -9,9 +9,9 @@ simultaneously using a polyphase channelizer.
 | SDR | Interface Flag | Bandwidth | Notes |
 |-----|---------------|-----------|-------|
 | bladeRF 2.0 | `-i bladerf0` | Up to 96 MHz (all-channel) | Only device supporting `-a` mode |
-| HackRF One | `-i hackrf-SERIAL` | 4-60 MHz | Default if no `-i` specified |
+| HackRF One | `-i hackrf-SERIAL` | 4-20 MHz | Default if no `-i` specified |
 | USRP (B200/B210) | `-i usrp-MODEL-SERIAL` | 4-56 MHz | Example: `-i usrp-B210-FCO2P05` |
-| SoapySDR | `-i soapy-N` | 4-60 MHz | Generic SDR support (if compiled with SoapySDR) |
+| SoapySDR | `-i soapy-N` | 4-X MHz | Generic SDR support (if compiled with SoapySDR) |
 
 To list available SDR devices:
 
@@ -35,6 +35,18 @@ Optional SoapySDR support:
 Optional ZeroMQ for network packet streaming:
 
     sudo apt install libzmq3-dev
+
+Optional GPS tagging (requires gpsd running):
+
+    sudo apt install libgps-dev
+
+**Web dashboard** (`tools/zmq_web_dashboard.py`) requires `pyzmq`:
+
+    pip install pyzmq
+
+Optional RPA resolution (`--irk-file`) requires `cryptography`:
+
+    pip install cryptography
 
 On macOS, fftw3 is not required and [Homebrew](https://brew.sh/) is the
 recommended package manager:
@@ -81,8 +93,11 @@ Optional:
     -s, --stats             Print performance stats periodically
     -v, --verbose           Print detailed info about captured bursts
     -I, --install           Install into Wireshark extcap folder
-    -Z, --zmq-pub=ENDPOINT  Publish packets via ZMQ PUB socket
+    -G, --gpsd              Tag packets with GPS coordinates from gpsd
+    -Z, --zmq-pub=ENDPOINT  Publish packets via ZMQ PUB bind socket
+    -X, --zmq-connect=ENDPOINT  Publish via ZMQ PUB connect (collector mode)
     -K, --zmq-curve-key=FILE  Enable CURVE encryption (requires key file)
+        --sensor-id=NAME      Sensor identity for multi-sensor deployments
 ```
 
 ### Examples
@@ -282,13 +297,32 @@ summaries.
   Addresses into a single device entry when the Identity Resolving Key is
   known. Uses the BT Core Spec `ah()` function (AES-128-ECB). Resolved
   devices are highlighted green with a count of observed MAC rotations.
+- **Classic BT support**: detects Classic Bluetooth (BR/EDR) LAP addresses
+  alongside BLE. Displays both protocols with color-coded badges (blue=BLE,
+  orange=BT) and protocol filter dropdown.
+- **UAP estimation**: for Classic BT devices, reverses the HEC (Header Error
+  Check) LFSR to recover the Upper Address Part (UAP) from accumulated
+  packet headers. Converges in as few as 5-10 packets for strong signals.
+- **Device database**: SQLite persistence across sessions (`--db`, `--no-db`).
+  Tracks first-ever-seen timestamps and marks genuinely new devices with a
+  "NEW" badge. Database stored at `~/.cache/ice9-bt-sniffer/devices.db`.
+- **Device alerting**: `--alert-new` fires alerts for never-before-seen
+  devices (uses the SQLite database). `--alert-file` watches for specific
+  MACs/identities. Alert actions: shell command (`--alert-cmd`), HTTP
+  webhook (`--alert-webhook`), and browser notifications.
 - **Summary tab**: breakdowns by manufacturer, MAC address type, PDU type,
-  and GATT services; top talkers list; channel activity heatmap
+  protocol, and GATT services; top talkers list; channel activity heatmap
 - **Privacy mode**: MAC addresses masked by default (toggle in UI)
-- **PCAP recording**: `--write` flag to simultaneously save to a PCAP file
+- **PCAP recording**: `--write` flag to simultaneously save to a PCAP file.
+  Uses PPI (DLT 192) encapsulation with per-packet DLT to support mixed
+  BLE + Classic BT packets in the same file.
 - **GPS mapping**: `--gps` flag enables GPS column and live map display
   (requires gpsd running, GPS coordinates embedded in PPI-wrapped PCAPs)
 - **CURVE encryption**: `--server-key` flag for encrypted ZMQ connections
+- **Multi-sensor multilateration**: when 2+ sensors with known GPS positions
+  observe the same device, estimates device position on the map using weighted
+  least squares. Sensors identified by `--sensor-id` on the sniffer side,
+  positions from GPS or `--sensor-pos` on the dashboard.
 - **Multi-sensor**: accepts multiple ZMQ endpoints for distributed deployments
 
 **Dashboard options:**
@@ -303,6 +337,15 @@ python3 tools/zmq_web_dashboard.py [endpoints...] [options]
   --bind                    Bind SUB socket instead of connecting
   --update-bt-db            Download/refresh Bluetooth numbers database
   --irk-file FILE           File of IRKs for RPA resolution (label:hex per line)
+  --sensor-pos LABEL:LAT,LON  Static sensor position (repeatable)
+  --path-loss-exp N         Path loss exponent (default: 2.0, indoor: 2.5-3.5)
+  --db FILE                 SQLite database path (default: ~/.cache/ice9-bt-sniffer/devices.db)
+  --no-db                   Disable persistent device database
+  --alert-file FILE         Watch file (one MAC/LAP/identity per line)
+  --alert-cmd CMD           Shell command on alert (env vars: ALERT_MAC, ALERT_NAME, etc.)
+  --alert-new               Alert on never-before-seen devices (requires database)
+  --alert-webhook URL       HTTP POST URL for alert notifications
+  --alert-cooldown N        Seconds between re-alerts for same device (default: 300)
 ```
 
 **Examples:**
@@ -319,6 +362,24 @@ python3 tools/zmq_web_dashboard.py [endpoints...] [options]
 
     # RPA resolution with Identity Resolving Keys:
     python3 tools/zmq_web_dashboard.py tcp://localhost:5555 --irk-file irks.txt
+
+    # Multi-sensor multilateration with static positions:
+    python3 tools/zmq_web_dashboard.py tcp://sensor1:5555 tcp://sensor2:5555 \
+        --sensor-pos roof:37.7749,-122.4194 --sensor-pos lobby:37.7751,-122.4190
+
+    # Multi-sensor with GPS (sensors have gpsd running):
+    python3 tools/zmq_web_dashboard.py tcp://sensor1:5555 tcp://sensor2:5555 --gps
+
+    # Alert on new devices with a shell command:
+    python3 tools/zmq_web_dashboard.py tcp://localhost:5555 \
+        --alert-new --alert-cmd 'echo "$ALERT_MAC $ALERT_PROTOCOL" >> /tmp/alerts.log'
+
+    # Watch for specific devices and send webhook:
+    python3 tools/zmq_web_dashboard.py tcp://localhost:5555 \
+        --alert-file watchlist.txt --alert-webhook http://localhost:9000/alert
+
+    # Disable persistent database (ephemeral session):
+    python3 tools/zmq_web_dashboard.py tcp://localhost:5555 --no-db
 
 **Bluetooth Numbers Database:**
 
@@ -341,7 +402,7 @@ Information) header format, compatible with Wireshark and Kismet.
     sudo gpsd /dev/ttyUSB0 -F /var/run/gpsd.sock
 
     # Capture with GPS tagging:
-    ice9-bluetooth -l -c 2441 -C 40 --zmq-pub tcp://*:5555 --check-crc
+    ice9-bluetooth -l -c 2441 -C 40 --gpsd --zmq-pub tcp://*:5555 --check-crc
 
     # Dashboard with GPS map:
     python3 tools/zmq_web_dashboard.py tcp://localhost:5555 --gps

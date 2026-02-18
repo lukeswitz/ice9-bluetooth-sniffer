@@ -32,6 +32,7 @@ extern int gpsd_active;
 
 static void *zmq_ctx = NULL;
 static void *zmq_pub = NULL;
+extern char *sensor_id;
 static void *zmq_control = NULL;
 extern sig_atomic_t running;
 extern hackrf_device *hackrf_device_global;
@@ -91,7 +92,33 @@ typedef struct __attribute__((packed)) _pcap_le_header_t {
 #define DLT_BLUETOOTH_LE_LL_WITH_PHDR 256
 #endif
 
+#if !defined( DLT_BLUETOOTH_BREDR_BB )
+#define DLT_BLUETOOTH_BREDR_BB 255
+#endif
+
 #define DLT_PPI 192
+
+/* Classic BT BR/EDR baseband header (DLT 255, Wireshark-compatible) */
+typedef struct __attribute__((packed)) _pcap_bredr_bb_header_t {
+    uint8_t rf_channel;
+    int8_t signal_power;
+    int8_t noise_power;
+    uint8_t access_code_offenses;
+    uint8_t payload_transport_rate;
+    uint8_t corrected_header_bits;
+    int16_t corrected_payload_bits;
+    uint32_t lap;
+    uint32_t ref_lap_uap;
+    uint32_t bt_header;
+    uint16_t flags;
+} pcap_bredr_bb_header_t;
+
+#define BREDR_SIGNAL_POWER_VALID   0x0004
+#define BREDR_NOISE_POWER_VALID    0x0008
+
+/* ZMQ packet type prefix bytes */
+#define ZMQ_PKT_TYPE_BLE  0x00
+#define ZMQ_PKT_TYPE_BT   0x01
 
 /* PPI (Per-Packet Information) header structures */
 typedef struct __attribute__((packed)) _ppi_header_t {
@@ -145,15 +172,9 @@ static uint32_t ppi_fixed6_4(double val) {
 
 pcap_t *pcap_open(char *path) {
     pcap_t *p;
-    uint32_t dlt = DLT_BLUETOOTH_LE_LL_WITH_PHDR;
-    uint32_t snaplen = 4 + 2 + 255 + 3;
-
-#ifdef HAVE_GPS
-    if (gpsd_active) {
-        dlt = DLT_PPI;
-        snaplen += PPI_GPS_SIZE;  /* room for PPI + GPS field */
-    }
-#endif
+    /* Always use PPI to support mixed BLE + Classic BT per-packet DLT */
+    uint32_t dlt = DLT_PPI;
+    uint32_t snaplen = PPI_GPS_SIZE + 4 + 2 + 255 + 3;
 
     pcap_hdr_t h = {
         .magic_number = 0xa1b2c3d4,
@@ -390,45 +411,32 @@ void *zmq_control_thread(void *arg) {
 static void zmq_pub_packet(pcaprec_hdr_t *ph, pcap_le_header_t *lh, uint8_t *data, unsigned len) {
     if (!zmq_pub)
         return;
-    unsigned msg_len = sizeof(*ph) + sizeof(*lh) + len;
+    unsigned msg_len = 1 + sizeof(*ph) + ll_len + data_len;
     uint8_t *buf = malloc(msg_len);
     if (!buf)
         return;
-    memcpy(buf, ph, sizeof(*ph));
-    memcpy(buf + sizeof(*ph), lh, sizeof(*lh));
-    memcpy(buf + sizeof(*ph) + sizeof(*lh), data, len);
-    zmq_send(zmq_pub, buf, msg_len, ZMQ_DONTWAIT);
-    free(buf);
-}
+    buf[0] = type_byte;
+    memcpy(buf + 1, ph, sizeof(*ph));
+    memcpy(buf + 1 + sizeof(*ph), ll_hdr, ll_len);
+    if (data_len)
+        memcpy(buf + 1 + sizeof(*ph) + ll_len, data, data_len);
 
-static void zmq_pub_packet_gps(zmq_gps_frame_t *gps, pcaprec_hdr_t *ph, pcap_le_header_t *lh, uint8_t *data, unsigned len) {
-    if (!zmq_pub)
-        return;
-    unsigned msg_len = sizeof(*ph) + sizeof(*lh) + len;
-    uint8_t *buf = malloc(msg_len);
-    if (!buf)
-        return;
-    memcpy(buf, ph, sizeof(*ph));
-    memcpy(buf + sizeof(*ph), lh, sizeof(*lh));
-    memcpy(buf + sizeof(*ph) + sizeof(*lh), data, len);
-
-    /* Send as multipart: frame 1 = GPS, frame 2 = PCAP record */
-    zmq_send(zmq_pub, gps, sizeof(*gps), ZMQ_DONTWAIT | ZMQ_SNDMORE);
+    if (sensor_id)
+        zmq_send(zmq_pub, sensor_id, strlen(sensor_id), ZMQ_DONTWAIT | ZMQ_SNDMORE);
+    if (gps)
+        zmq_send(zmq_pub, gps, sizeof(*gps), ZMQ_DONTWAIT | ZMQ_SNDMORE);
     zmq_send(zmq_pub, buf, msg_len, ZMQ_DONTWAIT);
     free(buf);
 }
 #endif
 
-// TODO timestamp
 void pcap_write_ble(pcap_t *p, ble_packet_t *b) {
     uint16_t flags = LE_DEWHITENED | LE_SIGNAL_POWER_VALID | LE_NOISE_POWER_VALID;
 
-    // Add CRC flags if checked
     if (b->crc_checked) {
         flags |= LE_CRC_CHECKED;
-        if (b->crc_valid) {
+        if (b->crc_valid)
             flags |= LE_CRC_VALID;
-        }
     }
 
     pcap_le_header_t le_header = {
@@ -440,107 +448,173 @@ void pcap_write_ble(pcap_t *p, ble_packet_t *b) {
 
     unsigned ble_payload_len = b->len + sizeof(le_header);
 
+    /* Always PPI-wrapped for PCAP file (supports mixed BLE + Classic BT) */
+    unsigned ppi_len = PPI_HDR_SIZE;
 #ifdef HAVE_GPS
     gps_fix_t fix = {0};
     if (gpsd_active)
         gps_tag_get_fix(&fix);
+    if (fix.valid)
+        ppi_len = PPI_GPS_SIZE;
+#endif
 
-    if (gpsd_active) {
-        /* PPI-wrapped output */
-        unsigned ppi_len;
-        if (fix.valid)
-            ppi_len = PPI_GPS_SIZE;
-        else
-            ppi_len = PPI_HDR_SIZE;
+    ppi_header_t ppi_hdr = {
+        .pph_version = 0,
+        .pph_flags = 0,
+        .pph_len = ppi_len,
+        .pph_dlt = DLT_BLUETOOTH_LE_LL_WITH_PHDR,
+    };
 
-        pcaprec_hdr_t pcap_header = {
-            .ts_sec   = b->timestamp.tv_sec,
-            .ts_usec  = b->timestamp.tv_nsec/1000,
-            .incl_len = ppi_len + ble_payload_len,
-            .orig_len = ppi_len + ble_payload_len,
-        };
+    pcaprec_hdr_t pcap_header = {
+        .ts_sec   = b->timestamp.tv_sec,
+        .ts_usec  = b->timestamp.tv_nsec/1000,
+        .incl_len = ppi_len + ble_payload_len,
+        .orig_len = ppi_len + ble_payload_len,
+    };
 
-        /* Build PPI header */
-        ppi_header_t ppi_hdr = {
-            .pph_version = 0,
-            .pph_flags = 0,
-            .pph_len = ppi_len,
-            .pph_dlt = DLT_BLUETOOTH_LE_LL_WITH_PHDR,
-        };
-
-        if (p) {
-            fwrite(&pcap_header, sizeof(pcap_header), 1, p->f);
-            fwrite(&ppi_hdr, sizeof(ppi_hdr), 1, p->f);
-
-            if (fix.valid) {
-                ppi_field_header_t fld_hdr = {
-                    .pfh_type = PPI_FIELD_GPS,
-                    .pfh_datalen = sizeof(ppi_gps_t),
-                };
-                ppi_gps_t gps = {
-                    .geotag_ver = 2,
-                    .geotag_pad = 0,
-                    .geotag_len = sizeof(ppi_gps_t),
-                    .present_flags = PPI_GPS_FLAG_GPSFLAGS | PPI_GPS_FLAG_LAT | PPI_GPS_FLAG_LON | PPI_GPS_FLAG_ALT,
-                    .gps_flags = 0,
-                    .lat = ppi_fixed3_7(fix.latitude),
-                    .lon = ppi_fixed3_7(fix.longitude),
-                    .alt = ppi_fixed6_4(fix.altitude),
-                };
-                fwrite(&fld_hdr, sizeof(fld_hdr), 1, p->f);
-                fwrite(&gps, sizeof(gps), 1, p->f);
-            }
-
-            fwrite(&le_header, sizeof(le_header), 1, p->f);
-            fwrite(b->data, b->len, 1, p->f);
-            fflush(p->f);
-        }
-
-#ifdef HAVE_ZMQ
-        /* ZMQ: send GPS as separate frame (multipart) */
+    if (p) {
+        fwrite(&pcap_header, sizeof(pcap_header), 1, p->f);
+        fwrite(&ppi_hdr, sizeof(ppi_hdr), 1, p->f);
+#ifdef HAVE_GPS
         if (fix.valid) {
-            zmq_gps_frame_t gps_frame = {
-                .latitude = fix.latitude,
-                .longitude = fix.longitude,
-                .altitude = fix.altitude,
+            ppi_field_header_t fld_hdr = {
+                .pfh_type = PPI_FIELD_GPS,
+                .pfh_datalen = sizeof(ppi_gps_t),
             };
-            /* Build PCAP record without PPI (DLT 256 format) for ZMQ */
-            pcaprec_hdr_t zmq_pcap_header = {
-                .ts_sec   = b->timestamp.tv_sec,
-                .ts_usec  = b->timestamp.tv_nsec/1000,
-                .incl_len = ble_payload_len,
-                .orig_len = ble_payload_len,
+            ppi_gps_t gps = {
+                .geotag_ver = 2,
+                .geotag_pad = 0,
+                .geotag_len = sizeof(ppi_gps_t),
+                .present_flags = PPI_GPS_FLAG_GPSFLAGS | PPI_GPS_FLAG_LAT | PPI_GPS_FLAG_LON | PPI_GPS_FLAG_ALT,
+                .gps_flags = 0,
+                .lat = ppi_fixed3_7(fix.latitude),
+                .lon = ppi_fixed3_7(fix.longitude),
+                .alt = ppi_fixed6_4(fix.altitude),
             };
-            zmq_pub_packet_gps(&gps_frame, &zmq_pcap_header, &le_header, b->data, b->len);
-        } else {
-            pcaprec_hdr_t zmq_pcap_header = {
-                .ts_sec   = b->timestamp.tv_sec,
-                .ts_usec  = b->timestamp.tv_nsec/1000,
-                .incl_len = ble_payload_len,
-                .orig_len = ble_payload_len,
-            };
-            zmq_pub_packet(&zmq_pcap_header, &le_header, b->data, b->len);
+            fwrite(&fld_hdr, sizeof(fld_hdr), 1, p->f);
+            fwrite(&gps, sizeof(gps), 1, p->f);
         }
 #endif
-    } else
-#endif /* HAVE_GPS */
+        fwrite(&le_header, sizeof(le_header), 1, p->f);
+        fwrite(b->data, b->len, 1, p->f);
+        fflush(p->f);
+    }
+
+#ifdef HAVE_ZMQ
     {
-        /* Standard DLT 256 output (no GPS) */
-        pcaprec_hdr_t pcap_header = {
+        /* ZMQ: type-prefixed PCAP record (no PPI -- dashboard handles routing) */
+        pcaprec_hdr_t zmq_ph = {
             .ts_sec   = b->timestamp.tv_sec,
             .ts_usec  = b->timestamp.tv_nsec/1000,
             .incl_len = ble_payload_len,
             .orig_len = ble_payload_len,
         };
-        if (p) {
-            fwrite(&pcap_header, sizeof(pcap_header), 1, p->f);
-            fwrite(&le_header, sizeof(le_header), 1, p->f);
-            fwrite(b->data, b->len, 1, p->f);
-            fflush(p->f);
+        zmq_gps_frame_t *gps_ptr = NULL;
+#ifdef HAVE_GPS
+        zmq_gps_frame_t gps_frame;
+        if (fix.valid) {
+            gps_frame.latitude = fix.latitude;
+            gps_frame.longitude = fix.longitude;
+            gps_frame.altitude = fix.altitude;
+            gps_ptr = &gps_frame;
         }
+#endif
+        zmq_pub_raw(ZMQ_PKT_TYPE_BLE, &zmq_ph,
+                     &le_header, sizeof(le_header),
+                     b->data, b->len, gps_ptr);
+    }
+#endif
+}
+
+void pcap_write_bt(pcap_t *p, classic_bt_packet_t *bt) {
+    pcap_bredr_bb_header_t hdr = {0};
+
+    hdr.rf_channel = bt->freq - 2402;  /* Classic BT: 0-78 */
+    hdr.signal_power = bt->rssi_db;
+    hdr.noise_power = bt->noise_db;
+    hdr.access_code_offenses = bt->ac_errors;
+    hdr.corrected_payload_bits = -1;
+    hdr.lap = bt->lap;
+    hdr.flags = BREDR_SIGNAL_POWER_VALID | BREDR_NOISE_POWER_VALID;
+
+    unsigned payload_len = bt->has_header ? 7 : 0;
+    unsigned total_len = sizeof(hdr) + payload_len;
+
+    /* Always PPI-wrapped for PCAP file */
+    unsigned ppi_len = PPI_HDR_SIZE;
+#ifdef HAVE_GPS
+    gps_fix_t fix = {0};
+    if (gpsd_active)
+        gps_tag_get_fix(&fix);
+    if (fix.valid)
+        ppi_len = PPI_GPS_SIZE;
+#endif
+
+    ppi_header_t ppi_hdr = {
+        .pph_version = 0,
+        .pph_flags = 0,
+        .pph_len = ppi_len,
+        .pph_dlt = DLT_BLUETOOTH_BREDR_BB,
+    };
+
+    pcaprec_hdr_t pcap_header = {
+        .ts_sec   = bt->timestamp.tv_sec,
+        .ts_usec  = bt->timestamp.tv_nsec/1000,
+        .incl_len = ppi_len + total_len,
+        .orig_len = ppi_len + total_len,
+    };
+
+    if (p) {
+        fwrite(&pcap_header, sizeof(pcap_header), 1, p->f);
+        fwrite(&ppi_hdr, sizeof(ppi_hdr), 1, p->f);
+#ifdef HAVE_GPS
+        if (fix.valid) {
+            ppi_field_header_t fld_hdr = {
+                .pfh_type = PPI_FIELD_GPS,
+                .pfh_datalen = sizeof(ppi_gps_t),
+            };
+            ppi_gps_t gps = {
+                .geotag_ver = 2,
+                .geotag_pad = 0,
+                .geotag_len = sizeof(ppi_gps_t),
+                .present_flags = PPI_GPS_FLAG_GPSFLAGS | PPI_GPS_FLAG_LAT | PPI_GPS_FLAG_LON | PPI_GPS_FLAG_ALT,
+                .gps_flags = 0,
+                .lat = ppi_fixed3_7(fix.latitude),
+                .lon = ppi_fixed3_7(fix.longitude),
+                .alt = ppi_fixed6_4(fix.altitude),
+            };
+            fwrite(&fld_hdr, sizeof(fld_hdr), 1, p->f);
+            fwrite(&gps, sizeof(gps), 1, p->f);
+        }
+#endif
+        fwrite(&hdr, sizeof(hdr), 1, p->f);
+        if (payload_len)
+            fwrite(bt->raw_header, payload_len, 1, p->f);
+        fflush(p->f);
+    }
 
 #ifdef HAVE_ZMQ
-        zmq_pub_packet(&pcap_header, &le_header, b->data, b->len);
+    {
+        pcaprec_hdr_t zmq_ph = {
+            .ts_sec   = bt->timestamp.tv_sec,
+            .ts_usec  = bt->timestamp.tv_nsec/1000,
+            .incl_len = total_len,
+            .orig_len = total_len,
+        };
+        zmq_gps_frame_t *gps_ptr = NULL;
+#ifdef HAVE_GPS
+        zmq_gps_frame_t gps_frame;
+        if (fix.valid) {
+            gps_frame.latitude = fix.latitude;
+            gps_frame.longitude = fix.longitude;
+            gps_frame.altitude = fix.altitude;
+            gps_ptr = &gps_frame;
+        }
 #endif
+        zmq_pub_raw(ZMQ_PKT_TYPE_BT, &zmq_ph,
+                     &hdr, sizeof(hdr),
+                     bt->has_header ? bt->raw_header : NULL, payload_len,
+                     gps_ptr);
     }
+#endif
 }

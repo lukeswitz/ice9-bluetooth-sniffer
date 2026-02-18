@@ -12,6 +12,7 @@ typedef struct _pcap_t pcap_t;
 pcap_t *pcap_open(char *path);
 void pcap_close(pcap_t *p);
 void pcap_write_ble(pcap_t *p, ble_packet_t *b);
+void pcap_write_bt(pcap_t *p, classic_bt_packet_t *bt);
 
 #ifdef HAVE_ZMQ
 int zmq_pub_init(const char *endpoint, const char *curve_keyfile, int connect_mode);
