@@ -1250,6 +1250,7 @@ class DashboardState:
         self.data_packets = 0
         self.gps_count = 0
         self.last_gps = None
+        self.browser_gps = None  # (lat, lon, alt) pushed from browser via /api/gps
         self.start_time = time.time()
         self.sse_queues = []
         # Device table: mac -> device info dict
@@ -1295,6 +1296,9 @@ class DashboardState:
                     pos = self.static_positions[sensor_id]
                     s["lat"] = pos[0]
                     s["lon"] = pos[1]
+                elif self.browser_gps:
+                    s["lat"] = round(self.browser_gps[0], 6)
+                    s["lon"] = round(self.browser_gps[1], 6)
 
             # Track channel activity per protocol
             rf_ch = pkt.get("rf_channel")
@@ -1339,22 +1343,31 @@ class DashboardState:
                 d["last"] = now
                 d["freq"] = pkt["freq_mhz"]
                 d["type"] = pkt["pdu_type"]
-                # RSSI: exponential moving average, alpha=0.2 (~5 packets to converge).
-                # Symmetric — asymmetric attack/decay is too susceptible to multipath
-                # spikes that push EMA near 0, producing bogus short-distance estimates.
+                # RSSI: running arithmetic mean (Welford's online algorithm) + min/max.
                 # Skips >= 0 — hardware sentinel for "no RSSI data" on most SDRs.
                 if rssi < 0:
+                    r = float(rssi)
                     if d["rssi"] is None:
-                        d["rssi"] = float(rssi)
+                        d["rssi"] = r
+                        d["rssi_min"] = r
+                        d["rssi_max"] = r
+                        d["rssi_n"] = 1
                     else:
-                        d["rssi"] = 0.2 * rssi + 0.8 * d["rssi"]
+                        n = d.get("rssi_n", 1) + 1
+                        d["rssi"] += (r - d["rssi"]) / n
+                        d["rssi_n"] = n
+                        if r < d["rssi_min"]:
+                            d["rssi_min"] = r
+                        if r > d["rssi_max"]:
+                            d["rssi_max"] = r
                 if pkt["crc_valid"]:
                     d["crc_ok"] += 1
                 elif pkt["crc_valid"] is False:
                     d["crc_bad"] += 1
-                if gps_info:
-                    d["lat"] = round(gps_info[0], 6)
-                    d["lon"] = round(gps_info[1], 6)
+                _eff_gps = gps_info or self.browser_gps
+                if _eff_gps:
+                    d["lat"] = round(_eff_gps[0], 6)
+                    d["lon"] = round(_eff_gps[1], 6)
                 # Update fingerprint fields (keep best info seen)
                 if fp.get("name") and not d.get("name"):
                     d["name"] = fp["name"]
@@ -1389,6 +1402,9 @@ class DashboardState:
                     "last": now,
                     "freq": pkt["freq_mhz"],
                     "rssi": float(rssi) if rssi < 0 else None,
+                    "rssi_min": float(rssi) if rssi < 0 else None,
+                    "rssi_max": float(rssi) if rssi < 0 else None,
+                    "rssi_n": 1 if rssi < 0 else 0,
                     "type": pkt["pdu_type"],
                     "pkts": 1,
                     "crc_ok": 1 if pkt["crc_valid"] else 0,
@@ -1405,9 +1421,10 @@ class DashboardState:
                 if identity:
                     d["rpa_addrs"] = {mac}
                     d["mac_type"] = "resolved"
-                if gps_info:
-                    d["lat"] = round(gps_info[0], 6)
-                    d["lon"] = round(gps_info[1], 6)
+                _eff_gps = gps_info or self.browser_gps
+                if _eff_gps:
+                    d["lat"] = round(_eff_gps[0], 6)
+                    d["lon"] = round(_eff_gps[1], 6)
                 # Classic BT: set up UAP estimator
                 if protocol == "BT":
                     d["_uap_est"] = UAPEstimator()
@@ -1424,13 +1441,17 @@ class DashboardState:
                     self.device_sensor_rssi[dev_key] = {}
                 dsr = self.device_sensor_rssi[dev_key]
                 if sensor_id not in dsr:
-                    dsr[sensor_id] = {"rssi_ema": None, "last": 0}
+                    dsr[sensor_id] = {"rssi_ema": None, "rssi_n": 0, "last": 0}
                 obs = dsr[sensor_id]
                 if rssi < 0:
+                    r = float(rssi)
                     if obs["rssi_ema"] is None:
-                        obs["rssi_ema"] = float(rssi)
+                        obs["rssi_ema"] = r
+                        obs["rssi_n"] = 1
                     else:
-                        obs["rssi_ema"] = 0.2 * rssi + 0.8 * obs["rssi_ema"]
+                        n = obs["rssi_n"] + 1
+                        obs["rssi_ema"] += (r - obs["rssi_ema"]) / n
+                        obs["rssi_n"] = n
                 obs["last"] = now
 
             # Persist to SQLite
@@ -1467,7 +1488,9 @@ class DashboardState:
                 "macs": len(self.devices),
                 "data_pkts": self.data_packets,
                 "gps_count": self.gps_count,
-                "last_gps": list(self.last_gps[:2]) if self.last_gps else None,
+                "last_gps": (list(self.last_gps[:2]) if self.last_gps
+                             else (list(self.browser_gps[:2]) if self.browser_gps else None)),
+                "browser_gps": self.browser_gps is not None,
                 "uptime": round(elapsed, 1),
             }
 
@@ -1479,10 +1502,12 @@ class DashboardState:
             devs = []
             for d in self.devices.values():
                 dd = dict(d)
-                # Round EMA for display/JSON
+                # Round mean/min/max for display/JSON
                 if d["rssi"] is not None:
                     dd["rssi"] = round(d["rssi"])
-                # Distance estimation from TX power + RSSI EMA
+                dd["rssi_min"] = round(d["rssi_min"]) if d.get("rssi_min") is not None else None
+                dd["rssi_max"] = round(d["rssi_max"]) if d.get("rssi_max") is not None else None
+                # Distance estimation from TX power + RSSI mean
                 tx = d.get("tx_pwr")
                 gain_delta = (current_vga_gain + current_lna_gain) - (initial_vga_gain + initial_lna_gain)
                 if tx is not None and d["rssi"] is not None and d["rssi"] < 0:
@@ -1848,6 +1873,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._serve_json({"ok": True})
             except Exception as e:
                 self._serve_json({"ok": False, "error": str(e)})
+        elif path == "/api/gps":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length))
+                lat = float(body["lat"])
+                lon = float(body["lon"])
+                alt = float(body.get("alt") or 0.0)
+                if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                    raise ValueError("coordinates out of range")
+                with state.lock:
+                    state.browser_gps = (lat, lon, alt)
+                self._serve_json({"ok": True})
+            except (KeyError, ValueError, json.JSONDecodeError):
+                self.send_error(400)
         elif path == "/api/control":
             content_length = int(self.headers['Content-Length'])
             body = self.rfile.read(content_length).decode()
@@ -2247,6 +2286,7 @@ td[data-col="rssi"] { font-family: 'Menlo', 'Monaco', 'Courier New', monospace; 
   <span>watched: <span class="val" id="sWatched">0</span></span>
   <span>data: <span class="val" id="sData">0</span></span>
   <span>up: <span class="val" id="sUp">0s</span></span>
+  <span id="gpsStatus" style="display:none;color:#4af;font-size:10px;margin-left:8px;"></span>
 </div>
 
 <div class="panel active" id="panelDevices">
@@ -2612,6 +2652,8 @@ function togglePrivacy() {
   b.classList.toggle('on', priv);
   renderDevices();
   if (summary) renderSummary(summary);
+  renderAlertLog();
+  renderWatchList(alertSettings.watch_list || []);
 }
 
 let sdrTimeout = null;
@@ -2770,7 +2812,9 @@ function rssiLabel(d) {
   else if (v >= -65) barIdx = 2;
   else if (v >= -80) barIdx = 1;
 
-  const tooltip = `Signal (EMA): ${v} dBm\nStrength: ${strength}`;
+  const lo = d.rssi_min != null ? d.rssi_min : v;
+  const hi = d.rssi_max != null ? d.rssi_max : v;
+  const tooltip = `avg: ${v} dBm  min: ${lo}  max: ${hi}\nStrength: ${strength}`;
   return `<span class="${color}" title="${tooltip}" style="cursor:help;white-space:nowrap">${bars[barIdx]} ${v}</span>`;
 }
 
@@ -3040,7 +3084,62 @@ if (GPS) {
   sc.onload=function(){
     map=L.map('map',{zoomControl:true}).setView([0,0],2);
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'OSM'}).addTo(map);
+    startBrowserGPS();
   }; document.body.appendChild(sc);
+}
+
+let browserMarker = null, browserRing = null, gpsMapCentered = false;
+
+function startBrowserGPS() {
+  if (!navigator.geolocation) return;
+  const statusEl = document.getElementById('gpsStatus');
+  if (statusEl) { statusEl.style.display = ''; statusEl.textContent = 'GPS: requesting...'; }
+
+  navigator.geolocation.watchPosition(
+    function(pos) {
+      const lat = pos.coords.latitude;
+      const lon = pos.coords.longitude;
+      const alt = pos.coords.altitude || 0;
+      const acc = Math.round(pos.coords.accuracy);
+      const ll = [lat, lon];
+
+      // Update status indicator
+      if (statusEl) statusEl.textContent = 'GPS \u00b1' + acc + 'm';
+
+      // Show / update "you are here" marker and accuracy ring
+      if (!browserMarker) {
+        browserMarker = L.circleMarker(ll, {
+          radius: 7, color: '#fff', weight: 2,
+          fillColor: '#4af', fillOpacity: 0.9
+        }).addTo(map).bindTooltip('You');
+        browserRing = L.circle(ll, {
+          radius: acc, color: '#4af', fillColor: '#4af',
+          fillOpacity: 0.08, weight: 1, dashArray: '4 4'
+        }).addTo(map);
+      } else {
+        browserMarker.setLatLng(ll);
+        browserRing.setLatLng(ll);
+        browserRing.setRadius(acc);
+      }
+
+      // Centre map on first fix (unless hardware GPS already moved it)
+      if (!gpsMapCentered && map) {
+        map.setView(ll, 15);
+        gpsMapCentered = true;
+      }
+
+      // Push to server so packets get GPS-tagged
+      fetch('/api/gps', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({lat: lat, lon: lon, alt: alt})
+      }).catch(function(){});
+    },
+    function(err) {
+      if (statusEl) statusEl.textContent = 'GPS: ' + err.message;
+    },
+    {enableHighAccuracy: true, maximumAge: 5000, timeout: 15000}
+  );
 }
 
 const es = new EventSource('/events');
