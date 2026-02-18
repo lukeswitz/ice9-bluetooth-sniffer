@@ -9,9 +9,9 @@ simultaneously using a polyphase channelizer.
 | SDR | Interface Flag | Bandwidth | Notes |
 |-----|---------------|-----------|-------|
 | bladeRF 2.0 | `-i bladerf0` | Up to 96 MHz (all-channel) | Only device supporting `-a` mode |
-| HackRF One | `-i hackrf-SERIAL` | 4-60 MHz | Default if no `-i` specified |
+| HackRF One | `-i hackrf-SERIAL` | 4-20 MHz | Default if no `-i` specified |
 | USRP (B200/B210) | `-i usrp-MODEL-SERIAL` | 4-56 MHz | Example: `-i usrp-B210-FCO2P05` |
-| SoapySDR | `-i soapy-N` | 4-60 MHz | Generic SDR support (if compiled with SoapySDR) |
+| SoapySDR | `-i soapy-N` | 4-X MHz | Generic SDR support (if compiled with SoapySDR) |
 
 To list available SDR devices:
 
