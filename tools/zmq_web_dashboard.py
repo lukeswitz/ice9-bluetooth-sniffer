@@ -1981,6 +1981,8 @@ th.sorted.asc::after { content: ' \25b2'; }
 td { padding: 3px 8px; border-bottom: 1px solid #2a2a2a; white-space: nowrap; }
 tr:hover td { background: #222; }
 tr.fresh td { background: #1a2a1a; }
+tr.watching td { background: #1a1a2e; border-top: 1px solid #446; }
+tr.watching.fresh td { background: #1a2a2e; }
 
 .dim { color: #666; }
 .grn { color: #7c4; }
@@ -2058,6 +2060,7 @@ td[data-col="rssi"] { font-family: 'Menlo', 'Monaco', 'Courier New', monospace; 
   <span>rate: <span class="val" id="sRate">0</span>/s</span>
   <span>crc: <span class="val" id="sCrc">--</span></span>
   <span>devices: <span class="val" id="sMacs">0</span></span>
+  <span>watched: <span class="val" id="sWatched">0</span></span>
   <span>data: <span class="val" id="sData">0</span></span>
   <span>up: <span class="val" id="sUp">0s</span></span>
 </div>
@@ -2285,6 +2288,9 @@ document.querySelectorAll('th[data-col]').forEach(th => {
 function sortDevices(devs) {
   const dir = sortAsc ? 1 : -1;
   return devs.slice().sort((a, b) => {
+    const wa = watched.has(a.mac) ? 0 : 1;
+    const wb = watched.has(b.mac) ? 0 : 1;
+    if (wa !== wb) return wa - wb;
     let va = a[sortCol], vb = b[sortCol];
     if (sortCol === 'services') { va = (a.services||[]).join(','); vb = (b.services||[]).join(','); }
     if (typeof va === 'string') return dir * va.localeCompare(vb);
@@ -2360,11 +2366,15 @@ function renderDevices() {
   const sorted = sortDevices(filtered);
   document.getElementById('empty').style.display = sorted.length ? 'none' : 'block';
 
+  document.getElementById('sWatched').textContent = watched.size;
   const frag = document.createDocumentFragment();
   for (const d of sorted) {
     const tr = document.createElement('tr');
     const fresh = (now - d.last) < 3;
-    if (fresh) tr.className = 'fresh';
+    const isWatched = watched.has(d.mac);
+    if (fresh && isWatched) tr.className = 'watching fresh';
+    else if (isWatched) tr.className = 'watching';
+    else if (fresh) tr.className = 'fresh';
     const proto = d.protocol || 'BLE';
     let mc, macCls;
     if (proto === 'BT') {
