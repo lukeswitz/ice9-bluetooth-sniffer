@@ -13,6 +13,7 @@ This document describes improvements made to ice9-bluetooth-sniffer:
 7. Classic Bluetooth (BR/EDR) detection pipeline with UAP estimation
 8. SQLite device database for cross-session persistence
 9. Device alerting (new-device, watch file, commands, webhooks)
+10. Sensor C2 (command and control) over ZMQ
 
 ## Changes Made
 
@@ -523,6 +524,127 @@ prevents alert storms.
 **RPA handling:** When IRKs are loaded, resolved devices use their identity
 label as the device key, so RPA rotations do not trigger repeat alerts.
 Without IRKs, each new random MAC is treated as a new device.
+
+### 10. Sensor C2 (Command and Control)
+
+**Problem:**
+Multi-sensor deployments had no way to monitor sensor health or adjust
+SDR parameters remotely. Operators had to SSH into each sensor to change
+gain, squelch, frequency, or channel count, and had no visibility into
+which sensors were online.
+
+**Solution:**
+Added a bidirectional C2 control channel using a ZMQ DEALER/ROUTER pattern
+on data_port + 1. Sensors send periodic heartbeats; the dashboard can
+send runtime commands back to individual sensors.
+
+**Architecture:**
+```
+  Dashboard                              Sensor
+  =========                              ======
+  SUB    :5555 (bind)    <-- data ---    PUB    (connect)     [existing]
+  ROUTER :5556 (bind)    <-- C2  -->     DEALER (connect)     [new]
+```
+
+Two ZMQ ports per deployment: the existing data PUB/SUB and a new C2
+DEALER/ROUTER. The control port is always data_port + 1. No additional
+CLI flags are needed -- the C2 channel starts automatically when `--zmq`
+is active.
+
+**Heartbeat (sensor -> dashboard, every 5 seconds):**
+- Sensor ID, SDR type (hackrf/bladerf/usrp/soapy)
+- Current gain (HackRF reports LNA + VGA separately)
+- Squelch threshold
+- Packet rate (packets/sec) and CRC validation percentage
+- Uptime (seconds since sensor start)
+- GPS coordinates (when `--gpsd` is active)
+
+**Dashboard status detection:**
+- **Online** (green): heartbeat < 15 seconds old
+- **Stale** (yellow): heartbeat 15-60 seconds old
+- **Offline** (red): no heartbeat for 60+ seconds
+
+**Runtime-tunable parameters:**
+| Parameter | Method | Notes |
+|-----------|--------|-------|
+| SDR gain | Vendor API call | HackRF: `hackrf_set_lna_gain` + `hackrf_set_vga_gain`; bladeRF: `bladerf_set_gain`; USRP: `uhd_usrp_set_rx_gain`; SoapySDR: `SoapySDRDevice_setGain` |
+| Squelch threshold | `agc_crcf_squelch_set_threshold()` | Applied to all burst catchers immediately |
+
+**Restart-required parameters:**
+| Parameter | Method | Notes |
+|-----------|--------|-------|
+| Center frequency | `execv()` re-exec | Rebuilds PFB channelizer and channel map |
+| Channel count | `execv()` re-exec | Rebuilds PFB, FFT, and burst catcher threads |
+
+The restart mechanism saves the original argv before `getopt()` modifies
+it, constructs a new argv with the changed parameters, runs normal cleanup
+(stops SDR, joins threads, closes sockets), then calls `execv()` to
+replace the process. The new sensor reconnects to the dashboard
+automatically.
+
+**Dashboard Nodes tab:**
+New tab alongside Devices and Summary showing all connected sensors:
+- Status indicator (green/yellow/red dot)
+- Sensor ID, SDR type, center frequency, channel count
+- Gain slider(s) and squelch slider for runtime adjustment
+- Packet rate, CRC percentage, uptime, GPS coordinates
+- Frequency/channel inputs with restart button for structural changes
+
+**Dashboard API endpoints:**
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/api/nodes` | Sensor list with C2 heartbeat data |
+| POST | `/api/c2/set_gain` | Adjust sensor gain |
+| POST | `/api/c2/set_squelch` | Adjust sensor squelch |
+| POST | `/api/c2/restart` | Restart sensor with new freq/channels |
+| POST | `/api/c2/get_status` | Request immediate heartbeat |
+
+**Thread safety:**
+- SDR gain APIs are internally serialized (USB control transfers)
+- Squelch is an atomic float write, effective on next AGC cycle
+- HTTP threads never touch the ROUTER socket directly; commands go
+  through a `queue.Queue` that the ROUTER thread drains each poll cycle
+- CRC counters read by heartbeat are informational (slight race is fine)
+
+**CURVE encryption:**
+The C2 channel reuses the same keypair as the data channel. DEALER acts
+as CURVE client, ROUTER as CURVE server. Enabled automatically when
+`--zmq-curve-key` / `--server-key` flags are used.
+
+**JSON protocol** uses cJSON (vendored, MIT license) on the C side.
+Dashboard uses Python stdlib `json`.
+
+**Usage:**
+```bash
+# Dashboard (binds data on 5555, C2 on 5556):
+python3 tools/zmq_web_dashboard.py tcp://*:5555
+
+# Sensors (connect to dashboard):
+ice9-bluetooth -l -c 2441 -C 60 --zmq tcp://dashboard:5555 --sensor-id roof
+ice9-bluetooth -l -c 2441 -C 40 --zmq tcp://dashboard:5555 --sensor-id lobby
+
+# With encryption:
+python3 tools/zmq_web_dashboard.py tcp://*:5555 --server-key server.key
+ice9-bluetooth -l -c 2441 -C 60 --zmq tcp://dashboard:5555 --zmq-curve-key server.key
+```
+
+**Files added:**
+- **control.c**: DEALER socket, heartbeat sender, command dispatch
+- **control.h**: Public API (init, loop, shutdown, set_sdr, save_argv)
+- **cjson/cJSON.c**: Vendored JSON parser (MIT license)
+- **cjson/cJSON.h**: Vendored JSON header
+
+**Files modified:**
+- **main.c**: Control thread lifecycle, SDR handle exposure, `execv()`
+  restart, `set_all_squelch()` dispatcher
+- **hackrf.c/h**: Non-const gains, `hackrf_set_gain_runtime()`
+- **bladerf.c/h**: Non-const gain, `bladerf_set_gain_runtime()`
+- **usrp.c/h**: Non-const gain, `usrp_set_gain_runtime()`
+- **soapysdr.c/h**: Non-const gain, `soapy_set_gain_runtime()`
+- **burst_catcher.c/h**: Non-const squelch, `burst_catcher_set_squelch()`
+- **CMakeLists.txt**: Added control.c and cJSON sources
+- **tools/zmq_web_dashboard.py**: ROUTER thread, Nodes tab, C2 API
+  endpoints, SSE nodes payload
 
 ## References
 

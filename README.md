@@ -265,6 +265,47 @@ A lightweight subscriber is also included in `tools/zmq_subscriber.py`:
 
 Requires pyzmq built with libsodium for CURVE support (`pip install pyzmq`).
 
+### Sensor C2 (Command and Control)
+
+When sensors connect to the dashboard via `--zmq`, a bidirectional C2
+control channel is automatically established on data_port + 1 (e.g. port
+5556 when data streams on 5555). No additional flags are needed.
+
+**Heartbeat monitoring:** Each sensor sends a JSON heartbeat every 5 seconds
+containing SDR type, gain, squelch, packet rate, CRC percentage, uptime,
+and GPS position. The dashboard tracks sensor status:
+- **Online** (green): heartbeat received within 15 seconds
+- **Stale** (yellow): heartbeat between 15 and 60 seconds old
+- **Offline** (red): no heartbeat for 60+ seconds
+
+**Runtime-tunable parameters:**
+- **SDR gain**: adjustable via the Nodes tab slider. HackRF exposes LNA
+  (0-40, step 8) and VGA (0-62, step 2) separately; other SDRs have a
+  single gain control.
+- **Squelch threshold**: adjustable via slider (-80 to -10 dB)
+
+**Restart-required parameters:**
+- **Center frequency** and **channel count** require rebuilding the polyphase
+  channelizer, so the sensor restarts itself (via `execv`) when these are
+  changed from the dashboard. The sensor reconnects automatically after
+  restart.
+
+**Dashboard Nodes tab:** shows all connected sensors with live status,
+current gain/squelch values, packet rate, CRC percentage, uptime, GPS
+coordinates, and controls for adjusting parameters or triggering a restart.
+
+    # Start dashboard (binds data on 5555, C2 on 5556):
+    python3 tools/zmq_web_dashboard.py tcp://*:5555
+
+    # Start sensors with distinct IDs:
+    ice9-bluetooth -l -c 2441 -C 60 --zmq tcp://dashboard:5555 --sensor-id roof
+    ice9-bluetooth -l -c 2441 -C 40 --zmq tcp://dashboard:5555 --sensor-id lobby
+
+    # Open http://localhost:8099 -> Nodes tab to monitor and control sensors
+
+CURVE encryption applies to the C2 channel as well -- both the DEALER
+(sensor) and ROUTER (dashboard) use the same keypair.
+
 ### Web Dashboard
 
 A real-time web dashboard is included in `tools/zmq_web_dashboard.py`. It
@@ -275,7 +316,7 @@ summaries.
 **Quick start:**
 
     # Start the dashboard (binds on port 5555, C2 on 5556):
-    pip install pyzmq   # only dependency
+    pip install pyzmq   # required dependency (cryptography also needed for --irk-file)
     python3 tools/zmq_web_dashboard.py tcp://*:5555
 
     # Start sensor(s) -- connect to the dashboard:

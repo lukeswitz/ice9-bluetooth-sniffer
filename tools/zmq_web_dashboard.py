@@ -1357,6 +1357,10 @@ class DashboardState:
                 dd["est_lon"] = None
                 dd["est_unc"] = None
                 dd["num_sensors"] = 0
+                dd["sensor_ids"] = []
+                if dev_key in self.device_sensor_rssi:
+                    dd["sensor_ids"] = sorted(self.device_sensor_rssi[dev_key].keys())
+                    dd["num_sensors"] = len(dd["sensor_ids"])
                 if tx is not None and dev_key in self.device_sensor_rssi:
                     obs = self.device_sensor_rssi[dev_key]
                     result = _estimate_device_position(
@@ -1365,7 +1369,6 @@ class DashboardState:
                         dd["est_lat"] = round(result[0], 6)
                         dd["est_lon"] = round(result[1], 6)
                         dd["est_unc"] = round(result[2], 1)
-                        dd["num_sensors"] = result[3]
                 # Persistence fields
                 dd["is_new"] = False
                 dd["first_ever"] = None
@@ -1993,6 +1996,11 @@ button.on { background: #653; border-color: #a75; color: #fa8; }
 .panel.active { display: flex; flex-direction: column; height: calc(100vh - 52px); }
 
 .table-area { flex: 1; overflow: auto; }
+.pager { padding: 4px 8px; background: #252525; border-top: 1px solid #333;
+         display: flex; align-items: center; gap: 8px; font-size: 11px; }
+.pager button:disabled { opacity: 0.3; cursor: default; }
+.pager select { font: 11px monospace; background: #333; color: #ccc; border: 1px solid #555;
+                padding: 1px 4px; }
 
 table { width: 100%; border-collapse: collapse; }
 thead { position: sticky; top: 0; z-index: 2; }
@@ -2075,10 +2083,13 @@ select.filter { font: 11px monospace; background: #333; color: #ccc; border: 1px
     <div class="tab" data-tab="summary" onclick="switchTab('summary')">summary</div>
     <div class="tab" data-tab="nodes" onclick="switchTab('nodes')">nodes</div>
   </div>
-  <select class="filter" id="protoFilter" onchange="renderDevices()" title="Protocol filter">
+  <select class="filter" id="protoFilter" onchange="curPage=1;renderDevices()" title="Protocol filter">
     <option value="all">all</option>
     <option value="BLE">BLE only</option>
     <option value="BT">BT only</option>
+  </select>
+  <select class="filter" id="sensorFilter" onchange="curPage=1;renderDevices()" title="Sensor filter">
+    <option value="all">all sensors</option>
   </select>
   <span class="spacer"></span>
   <button onclick="location.href='/api/export.csv'">export CSV</button>
@@ -2118,6 +2129,16 @@ select.filter { font: 11px monospace; background: #333; color: #ccc; border: 1px
       <tbody id="tb"></tbody>
     </table>
     <div class="empty" id="empty">waiting for devices...</div>
+    <div class="pager" id="pager" style="display:none">
+      <button id="pgPrev" onclick="curPage--;renderDevices()">&laquo; prev</button>
+      <span id="pgInfo" class="dim"></span>
+      <button id="pgNext" onclick="curPage++;renderDevices()">next &raquo;</button>
+      <select id="pgSize" onchange="pageSize=+this.value;curPage=1;renderDevices()" title="Devices per page">
+        <option value="25">25</option>
+        <option value="50" selected>50</option>
+        <option value="100">100</option>
+      </select>
+    </div>
   </div>
 </div>
 
@@ -2167,6 +2188,8 @@ let sortCol = 'last', sortAsc = false;
 const GPS = __GPS_ENABLED__;
 const tb = document.getElementById('tb');
 let devices = [], summary = null;
+let curPage = 1, pageSize = 50;
+let knownSensors = new Set();
 
 function switchTab(name) {
   curTab = name;
@@ -2213,6 +2236,7 @@ document.querySelectorAll('th[data-col]').forEach(th => {
     const col = th.dataset.col;
     if (sortCol === col) { sortAsc = !sortAsc; }
     else { sortCol = col; sortAsc = false; }
+    curPage = 1;
     document.querySelectorAll('th').forEach(h => { h.classList.remove('sorted','asc'); });
     th.classList.add('sorted');
     if (sortAsc) th.classList.add('asc');
@@ -2274,16 +2298,60 @@ function btMacLabel(d) {
   return d.mac;
 }
 
+function updateSensorFilter() {
+  // Collect all sensor IDs from device data
+  for (const d of devices) {
+    if (d.sensor_ids) d.sensor_ids.forEach(s => knownSensors.add(s));
+  }
+  const sel = document.getElementById('sensorFilter');
+  const cur = sel.value;
+  const opts = ['all', ...Array.from(knownSensors).sort()];
+  if (sel.options.length !== opts.length) {
+    sel.innerHTML = '';
+    for (const o of opts) {
+      const opt = document.createElement('option');
+      opt.value = o;
+      opt.textContent = o === 'all' ? 'all sensors' : o;
+      sel.appendChild(opt);
+    }
+    sel.value = cur && opts.includes(cur) ? cur : 'all';
+  }
+}
+
 function renderDevices() {
+  updateSensorFilter();
   const now = Date.now() / 1000;
   const pf = document.getElementById('protoFilter').value;
+  const sf = document.getElementById('sensorFilter').value;
   let filtered = devices;
-  if (pf !== 'all') filtered = devices.filter(d => (d.protocol||'BLE') === pf);
+  if (pf !== 'all') filtered = filtered.filter(d => (d.protocol||'BLE') === pf);
+  if (sf !== 'all') filtered = filtered.filter(d => d.sensor_ids && d.sensor_ids.includes(sf));
   const sorted = sortDevices(filtered);
   document.getElementById('empty').style.display = sorted.length ? 'none' : 'block';
 
+  // Pagination
+  const totalPages = Math.max(1, Math.ceil(sorted.length / pageSize));
+  if (curPage > totalPages) curPage = totalPages;
+  if (curPage < 1) curPage = 1;
+  const start = (curPage - 1) * pageSize;
+  const page = sorted.slice(start, start + pageSize);
+
+  const pager = document.getElementById('pager');
+  if (sorted.length > pageSize) {
+    pager.style.display = 'flex';
+    document.getElementById('pgPrev').disabled = curPage <= 1;
+    document.getElementById('pgNext').disabled = curPage >= totalPages;
+    document.getElementById('pgInfo').textContent =
+      (start+1)+'-'+Math.min(start+pageSize, sorted.length)+' of '+sorted.length+' devices (page '+curPage+'/'+totalPages+')';
+  } else {
+    pager.style.display = sorted.length ? 'flex' : 'none';
+    document.getElementById('pgPrev').disabled = true;
+    document.getElementById('pgNext').disabled = true;
+    document.getElementById('pgInfo').textContent = sorted.length+' devices';
+  }
+
   const frag = document.createDocumentFragment();
-  for (const d of sorted) {
+  for (const d of page) {
     const tr = document.createElement('tr');
     const fresh = (now - d.last) < 3;
     if (fresh) tr.className = 'fresh';
@@ -2537,6 +2605,7 @@ function toggleWatch(mac) {
 
 /* --- Nodes tab --- */
 let nodesData = [];
+let nodesDragging = false;
 
 function c2Post(endpoint, body) {
   fetch(endpoint, {
@@ -2574,7 +2643,14 @@ function c2GetStatus(sensorId) {
   c2Post('/api/c2/get_status', {sensor_id: sensorId});
 }
 
+/* Show slider value live while dragging (label next to slider) */
+function sliderPreview(el, labelId) {
+  const lbl = labelId ? document.getElementById(labelId) : el.nextElementSibling;
+  if (lbl) lbl.textContent = el.value;
+}
+
 function renderNodes() {
+  if (nodesDragging) return;  /* don't clobber sliders mid-drag */
   const ntb = document.getElementById('nodesTb');
   const empty = document.getElementById('nodesEmpty');
   if (!nodesData.length) { ntb.innerHTML = ''; empty.style.display = 'block'; return; }
@@ -2593,16 +2669,22 @@ function renderNodes() {
       if (n.sdr === 'hackrf' && n.gain.lna != null) {
         gainHtml = '<div class="node-ctrl">' +
           'LNA <input type="range" min="0" max="40" step="8" value="'+n.gain.lna+'" ' +
-          'onchange="c2SetGain(\''+n.id+'\',\'hackrf\',this.value,\'lna\')">' +
+          'oninput="sliderPreview(this,\'gl-'+sid+'\')" ' +
+          'onmousedown="nodesDragging=true" ontouchstart="nodesDragging=true" ' +
+          'onchange="nodesDragging=false;c2SetGain(\''+n.id+'\',\'hackrf\',this.value,\'lna\')">' +
           '<span class="val-label" id="gl-'+sid+'">'+n.gain.lna+'</span>' +
           'VGA <input type="range" min="0" max="62" step="2" value="'+n.gain.vga+'" ' +
-          'onchange="c2SetGain(\''+n.id+'\',\'hackrf\',this.value,\'vga\')">' +
+          'oninput="sliderPreview(this,\'gv-'+sid+'\')" ' +
+          'onmousedown="nodesDragging=true" ontouchstart="nodesDragging=true" ' +
+          'onchange="nodesDragging=false;c2SetGain(\''+n.id+'\',\'hackrf\',this.value,\'vga\')">' +
           '<span class="val-label" id="gv-'+sid+'">'+n.gain.vga+'</span></div>';
       } else {
         const gv = n.gain.value != null ? n.gain.value : n.gain;
         gainHtml = '<div class="node-ctrl">' +
           '<input type="range" min="0" max="76" step="1" value="'+gv+'" ' +
-          'onchange="c2SetGain(\''+n.id+'\',\''+n.sdr+'\',this.value,\'gain\')">' +
+          'oninput="sliderPreview(this)" ' +
+          'onmousedown="nodesDragging=true" ontouchstart="nodesDragging=true" ' +
+          'onchange="nodesDragging=false;c2SetGain(\''+n.id+'\',\''+n.sdr+'\',this.value,\'gain\')">' +
           '<span class="val-label">'+gv+'</span></div>';
       }
     }
@@ -2610,15 +2692,17 @@ function renderNodes() {
     if (n.has_c2 && n.squelch != null) {
       sqlHtml = '<div class="node-ctrl">' +
         '<input type="range" min="-80" max="-10" step="1" value="'+n.squelch+'" ' +
-        'onchange="c2SetSquelch(\''+n.id+'\',this.value)">' +
+        'oninput="sliderPreview(this)" ' +
+        'onmousedown="nodesDragging=true" ontouchstart="nodesDragging=true" ' +
+        'onchange="nodesDragging=false;c2SetSquelch(\''+n.id+'\',this.value)">' +
         '<span class="val-label">'+n.squelch+'</span></div>';
     }
     let ctrlHtml = '';
     if (n.has_c2) {
       const sid = n.id.replace(/[^a-zA-Z0-9_-]/g,'_');
       ctrlHtml = '<div class="node-ctrl">' +
-        '<input type="number" id="restart-freq-'+sid+'" placeholder="freq" value="'+(n.center_freq||'')+'" style="width:55px">' +
-        '<input type="number" id="restart-ch-'+sid+'" placeholder="ch" value="'+(n.channels||'')+'" style="width:40px">' +
+        '<input type="number" id="restart-freq-'+sid+'" placeholder="freq" value="'+(n.center_freq||'')+'" style="width:55px" onfocus="nodesDragging=true" onblur="nodesDragging=false">' +
+        '<input type="number" id="restart-ch-'+sid+'" placeholder="ch" value="'+(n.channels||'')+'" style="width:40px" onfocus="nodesDragging=true" onblur="nodesDragging=false">' +
         '<button onclick="c2Restart(\''+n.id+'\')" style="color:#f88">restart</button>' +
         '<button onclick="c2GetStatus(\''+n.id+'\')">refresh</button></div>';
     }
