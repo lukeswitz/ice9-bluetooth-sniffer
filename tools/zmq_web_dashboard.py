@@ -1152,12 +1152,11 @@ def _haversine_m(lat1, lon1, lat2, lon2):
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
-def _estimate_device_position(sensor_obs, sensors, tx_power, path_loss_exp,
-                               cal_offset=0.0):
+def _estimate_device_position(sensor_obs, sensors, tx_power, path_loss_exp):
     """Estimate device position from multiple sensor distance estimates.
 
-    rssi_ema values are expected to already be normalized to the initial-gain
-    reference frame (gain_delta applied at storage time in add_packet).
+    rssi_ema values are already calibrated by the SDR backend and normalized to
+    the initial-gain reference frame at storage time in add_packet.
 
     Returns (lat, lon, uncertainty_m, num_sensors) or None.
     """
@@ -1168,7 +1167,7 @@ def _estimate_device_position(sensor_obs, sensors, tx_power, path_loss_exp,
             continue
         if obs["rssi_ema"] is None:
             continue
-        rssi_val = obs["rssi_ema"] - cal_offset
+        rssi_val = obs["rssi_ema"]
         measured_1m = tx_power - 41
         dist = 10 ** ((measured_1m - rssi_val) / (10.0 * path_loss_exp))
         weight = 1.0
@@ -1521,15 +1520,18 @@ class DashboardState:
                 dd["rssi_min"] = round(d["rssi_min"]) if d.get("rssi_min") is not None else None
                 dd["rssi_max"] = round(d["rssi_max"]) if d.get("rssi_max") is not None else None
                 # Distance estimation from TX power + RSSI mean.
-                # RSSI is already normalized to initial-gain frame at storage time,
-                # so only the fixed calibration offset is applied here.
+                # RSSI is already calibrated by the SDR backend and normalized to
+                # the initial-gain frame at storage time — use it directly.
                 tx = d.get("tx_pwr")
-                if tx is not None and d["rssi"] is not None and d["rssi"] < 0:
-                    corrected_rssi = d["rssi"] - rssi_calibration_offset
-                    measured = tx - 41  # expected RSSI at 1m for BLE 2.4 GHz
+                if d["rssi"] is not None and d["rssi"] < 0:
+                    corrected_rssi = d["rssi"]
+                    effective_tx = tx if tx is not None else 0  # 0 dBm: BLE standard baseline
+                    measured = effective_tx - 41  # expected RSSI at 1m for BLE 2.4 GHz
                     dd["est_dist"] = round(10 ** ((measured - corrected_rssi) / (10.0 * self.path_loss_exp)), 1)
+                    dd["est_dist_approx"] = tx is None
                 else:
                     dd["est_dist"] = None
+                    dd["est_dist_approx"] = False
                 # Multilateration
                 dev_key = d["mac"]
                 dd["est_lat"] = None
@@ -1543,8 +1545,7 @@ class DashboardState:
                 if tx is not None and dev_key in self.device_sensor_rssi:
                     obs = self.device_sensor_rssi[dev_key]
                     result = _estimate_device_position(
-                        obs, self.sensors, tx, self.path_loss_exp,
-                        cal_offset=rssi_calibration_offset)
+                        obs, self.sensors, tx, self.path_loss_exp)
                     if result:
                         dd["est_lat"] = round(result[0], 6)
                         dd["est_lon"] = round(result[1], 6)
@@ -3166,7 +3167,7 @@ function renderDevices() {
       }
     }
     if (d.is_new) mc += ' <span style="color:#f55;font-size:9px;font-weight:bold">NEW</span>';
-    const dist = d.est_dist != null ? '~'+d.est_dist+'m' : '';
+    const dist = d.est_dist != null ? '~'+d.est_dist+'m'+(d.est_dist_approx?'?':'') : '';
     const total = d.crc_ok + d.crc_bad;
     const crcPct = total > 0 ? Math.round(100*d.crc_ok/total)+'%' : '-';
     const crcCls = total > 0 ? (d.crc_ok/total > 0.8 ? 'grn' : d.crc_ok/total > 0.4 ? 'yel' : 'red') : 'dim';

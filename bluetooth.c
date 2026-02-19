@@ -80,9 +80,13 @@ float bluetooth_get_rssi_offset(void) {
 }
 
 void bluetooth_init_rssi_calibration(const char *sdr_name, int gain, unsigned channels) {
-    rssi_calibration_offset = 20.0f * log10f((float)channels);
-    fprintf(stderr, "RSSI: compensating for FFT 1/%u scaling = +%.1f dB\n",
-            channels, rssi_calibration_offset);
+    // Compensate for two factors:
+    //   +20*log10(N): agc_submit divides each channel by N before the AGC
+    //   -60 dB: burst_catcher sets signal_level=1e-3, which shifts get_rssi by
+    //           -20*log10(1e-3) = +60 dB; subtract it back out here
+    rssi_calibration_offset = 20.0f * log10f((float)channels) - 60.0f;
+    fprintf(stderr, "RSSI: calibration offset = %.1f dB (channels=%u)\n",
+            rssi_calibration_offset, channels);
 }
 
 // Whitening bit lookup: index into pre-computed sequence at channel-specific offset
