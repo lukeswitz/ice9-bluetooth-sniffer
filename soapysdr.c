@@ -223,6 +223,14 @@ void *soapy_stream_thread(void *arg) {
     return NULL;
 }
 
+int soapy_set_gain_runtime(void *dev, double gain) {
+    SoapySDRDevice *device = (SoapySDRDevice *)dev;
+    int rc = SoapySDRDevice_setGain(device, SOAPY_SDR_RX, 0, gain);
+    if (rc == 0)
+        soapy_gain_val = gain;
+    return rc;
+}
+
 void soapy_close(SoapySDRDevice *device) {
     SoapySDRDevice_unmake(device);
 }

@@ -3,35 +3,32 @@
 """
 Live web dashboard for ice9-bluetooth-sniffer ZMQ streams.
 
-Connects to one or more ZMQ PUB endpoints and presents a Kismet-style device
-list with BLE device fingerprinting, CRC-gated tracking, and aggregate
-summaries. Features a privacy toggle to mask MAC addresses (useful for video
-recording / streaming).
+Binds SUB and C2 ROUTER sockets; sensors connect to us. Presents a
+Kismet-style device list with BLE device fingerprinting, CRC-gated
+tracking, aggregate summaries, and per-sensor C2 controls. Features a
+privacy toggle to mask MAC addresses (useful for video/streaming).
 
 Usage:
-    # Basic - connect to local sensor:
-    python3 zmq_web_dashboard.py tcp://localhost:5555
+    # Basic - listen for sensors on port 5555 (C2 auto-binds on 5556):
+    python3 zmq_web_dashboard.py tcp://*:5555
 
-    # Multiple sensors:
-    python3 zmq_web_dashboard.py tcp://sensor1:5555 tcp://sensor2:5555
-
-    # Custom port:
-    python3 zmq_web_dashboard.py tcp://localhost:5555 --port 8080
+    # Custom HTTP port:
+    python3 zmq_web_dashboard.py tcp://*:5555 --port 8080
 
     # With GPS map:
-    python3 zmq_web_dashboard.py tcp://sensor:5555 --gps
+    python3 zmq_web_dashboard.py tcp://*:5555 --gps
 
     # Encrypted connection:
-    python3 zmq_web_dashboard.py tcp://sensor:5555 --server-key server.key.pub
+    python3 zmq_web_dashboard.py tcp://*:5555 --server-key server.key
 
     # Also write PCAP while viewing dashboard:
-    python3 zmq_web_dashboard.py tcp://localhost:5555 -w capture.pcap --gps
+    python3 zmq_web_dashboard.py tcp://*:5555 -w capture.pcap --gps
 
     # Update Bluetooth device database (Nordic Semiconductor, MIT licensed):
-    python3 zmq_web_dashboard.py tcp://localhost:5555 --update-bt-db
+    python3 zmq_web_dashboard.py tcp://*:5555 --update-bt-db
 
     # RPA resolution with Identity Resolving Keys:
-    python3 zmq_web_dashboard.py tcp://localhost:5555 --irk-file irks.txt
+    python3 zmq_web_dashboard.py tcp://*:5555 --irk-file irks.txt
 
 Requirements:
     pip install pyzmq
@@ -1271,6 +1268,9 @@ class DashboardState:
         # Persistence and alerting (set externally after construction)
         self.db = None          # DeviceDB instance
         self.alert_mgr = None   # AlertManager instance
+        # C2 control state
+        self.c2_sensor_status = {}   # sensor_id -> heartbeat data + last_heartbeat
+        self.c2_outbox = queue.Queue()  # (sensor_id_bytes, json_bytes) for ROUTER
 
     def add_packet(self, pkt, gps_info=None, sensor_id=None):
         global current_vga_gain, current_lna_gain, initial_vga_gain, initial_lna_gain
@@ -1536,6 +1536,10 @@ class DashboardState:
                 dd["est_lon"] = None
                 dd["est_unc"] = None
                 dd["num_sensors"] = 0
+                dd["sensor_ids"] = []
+                if dev_key in self.device_sensor_rssi:
+                    dd["sensor_ids"] = sorted(self.device_sensor_rssi[dev_key].keys())
+                    dd["num_sensors"] = len(dd["sensor_ids"])
                 if tx is not None and dev_key in self.device_sensor_rssi:
                     obs = self.device_sensor_rssi[dev_key]
                     result = _estimate_device_position(
@@ -1677,6 +1681,84 @@ class DashboardState:
             if q in self.sse_queues:
                 self.sse_queues.remove(q)
 
+    def update_sensor_c2(self, sensor_id, heartbeat):
+        """Update C2 sensor status from a heartbeat message."""
+        with self.lock:
+            heartbeat["last_heartbeat"] = time.time()
+            self.c2_sensor_status[sensor_id] = heartbeat
+
+    def send_c2_command(self, sensor_id, cmd, params=None):
+        """Queue a C2 command for delivery by the ROUTER thread."""
+        msg = {"cmd": cmd, "req_id": f"r{int(time.time()*1000) % 1000000}"}
+        if params:
+            msg.update(params)
+        self.c2_outbox.put((sensor_id.encode(), json.dumps(msg).encode()))
+
+    def get_sensor_nodes(self):
+        """Return merged sensor list with C2 heartbeat data."""
+        with self.lock:
+            now = time.time()
+            nodes = {}
+            # Start with data-path sensors
+            for sid, s in self.sensors.items():
+                nodes[sid] = {
+                    "id": sid,
+                    "status": "online" if (now - s["last_seen"]) < 15 else
+                              "stale" if (now - s["last_seen"]) < 60 else "offline",
+                    "lat": s["lat"], "lon": s["lon"],
+                    "pkts": s["pkts"], "last_seen": s["last_seen"],
+                    "sdr": None, "center_freq": None, "channels": None,
+                    "gain": None, "squelch": None,
+                    "pkt_rate": None, "crc_pct": None,
+                    "uptime": None, "has_c2": False,
+                }
+            # Merge C2 heartbeat data
+            for sid, hb in self.c2_sensor_status.items():
+                age = now - hb.get("last_heartbeat", 0)
+                status = "online" if age < 15 else "stale" if age < 60 else "offline"
+                if sid in nodes:
+                    n = nodes[sid]
+                    n["has_c2"] = True
+                    n["status"] = status
+                    n["sdr"] = hb.get("sdr")
+                    n["center_freq"] = hb.get("center_freq")
+                    n["channels"] = hb.get("channels")
+                    n["gain"] = hb.get("gain")
+                    n["squelch"] = hb.get("squelch")
+                    n["pkt_rate"] = hb.get("pkt_rate")
+                    n["crc_pct"] = hb.get("crc_pct")
+                    n["uptime"] = hb.get("uptime")
+                    if hb.get("gps"):
+                        n["lat"] = hb["gps"][0]
+                        n["lon"] = hb["gps"][1]
+                else:
+                    nodes[sid] = {
+                        "id": sid, "status": status, "has_c2": True,
+                        "lat": hb.get("gps", [None])[0] if hb.get("gps") else None,
+                        "lon": hb.get("gps", [None, None])[1] if hb.get("gps") else None,
+                        "pkts": 0, "last_seen": hb.get("last_heartbeat", 0),
+                        "sdr": hb.get("sdr"),
+                        "center_freq": hb.get("center_freq"),
+                        "channels": hb.get("channels"),
+                        "gain": hb.get("gain"),
+                        "squelch": hb.get("squelch"),
+                        "pkt_rate": hb.get("pkt_rate"),
+                        "crc_pct": hb.get("crc_pct"),
+                        "uptime": hb.get("uptime"),
+                    }
+            # Add static positions that haven't been seen
+            for label, (lat, lon) in self.static_positions.items():
+                if label not in nodes:
+                    nodes[label] = {
+                        "id": label, "status": "offline", "has_c2": False,
+                        "lat": lat, "lon": lon,
+                        "pkts": 0, "last_seen": 0,
+                        "sdr": None, "center_freq": None, "channels": None,
+                        "gain": None, "squelch": None,
+                        "pkt_rate": None, "crc_pct": None, "uptime": None,
+                    }
+            return list(nodes.values())
+
 
 # ---------------------------------------------------------------------------
 # HTTP server
@@ -1715,6 +1797,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._serve_json(state.get_summary())
         elif path == "/api/sensors":
             self._serve_json(state.get_sensors())
+        elif path == "/api/nodes":
+            self._serve_json(state.get_sensor_nodes())
         elif path == "/api/export.csv":
             self._serve_csv()
         elif path == "/api/export.json":
@@ -1735,6 +1819,68 @@ class DashboardHandler(BaseHTTPRequestHandler):
         else:
             self.send_error(404)
 
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if path == "/api/watch":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length))
+                mac = body.get("mac", "")
+                watch = body.get("watch", False)
+                if state.alert_mgr:
+                    if watch:
+                        state.alert_mgr.watch_set.add(mac.lower())
+                    else:
+                        state.alert_mgr.watch_set.discard(mac.lower())
+                self._serve_json({"ok": True})
+            except Exception:
+                self.send_error(400)
+        elif path.startswith("/api/c2/"):
+            self._handle_c2(path)
+        else:
+            self.send_error(404)
+
+    def _handle_c2(self, path):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length > 0 else {}
+        except Exception:
+            self.send_error(400)
+            return
+
+        sensor_id = body.get("sensor_id", "")
+        if not sensor_id:
+            self._serve_json({"ok": False, "error": "sensor_id required"})
+            return
+
+        if path == "/api/c2/set_gain":
+            params = {}
+            if "gain" in body:
+                params["gain"] = float(body["gain"])
+            if "lna" in body:
+                params["lna"] = int(body["lna"])
+            if "vga" in body:
+                params["vga"] = int(body["vga"])
+            state.send_c2_command(sensor_id, "set_gain", params)
+            self._serve_json({"ok": True})
+        elif path == "/api/c2/set_squelch":
+            threshold = float(body.get("threshold", -45))
+            state.send_c2_command(sensor_id, "set_squelch",
+                                  {"threshold": threshold})
+            self._serve_json({"ok": True})
+        elif path == "/api/c2/restart":
+            params = {}
+            if "center_freq" in body:
+                params["center_freq"] = int(body["center_freq"])
+            if "channels" in body:
+                params["channels"] = int(body["channels"])
+            state.send_c2_command(sensor_id, "restart", params)
+            self._serve_json({"ok": True})
+        elif path == "/api/c2/get_status":
+            state.send_c2_command(sensor_id, "get_status")
+            self._serve_json({"ok": True})
+        else:
+            self.send_error(404)
 
     def _serve_html(self):
         self.send_response(200)
@@ -1804,12 +1950,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 stats = state.get_stats()
                 summary = state.get_summary()
                 sensors = state.get_sensors()
+                nodes = state.get_sensor_nodes()
                 alerts = []
                 if state.alert_mgr:
                     alerts = state.alert_mgr.get_pending_alerts()
                 payload = json.dumps({"stats": stats, "devices": devs,
                                       "summary": summary, "sensors": sensors,
-                                      "alerts": alerts})
+                                      "nodes": nodes, "alerts": alerts})
                 self.wfile.write(f"event: update\ndata: {payload}\n\n".encode())
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionError, OSError):
@@ -2084,72 +2231,32 @@ def _process_zmq_message(frames, pcap_file, use_gps, fallback_sensor_id=None):
         state.add_packet(pkt, gps_info, sensor_id)
 
 
-def zmq_receiver(endpoints, server_key_path, pcap_file, use_gps, bind_mode=False):
+def zmq_receiver(endpoints, server_key_path, pcap_file, use_gps):
+    """Bind SUB socket(s) and receive packets from connecting sensors."""
     ctx = zmq.Context()
+    sub = ctx.socket(zmq.SUB)
+    sub.setsockopt(zmq.SUBSCRIBE, b"")
+    sub.setsockopt(zmq.RCVTIMEO, 1000)
+    if server_key_path:
+        server_public_key = parse_server_pubkey(server_key_path)
+        client_public, client_secret = zmq.curve_keypair()
+        sub.setsockopt(zmq.CURVE_SERVERKEY, server_public_key)
+        sub.setsockopt(zmq.CURVE_PUBLICKEY, client_public)
+        sub.setsockopt(zmq.CURVE_SECRETKEY, client_secret)
+    for ep in endpoints:
+        sub.bind(ep)
+        print(f"  Listening on {ep}", file=sys.stderr)
 
-    if bind_mode:
-        # Bind mode: single socket, sensor ID comes from ZMQ frame
-        sub = ctx.socket(zmq.SUB)
-        sub.setsockopt(zmq.SUBSCRIBE, b"")
-        sub.setsockopt(zmq.RCVTIMEO, 1000)
-        if server_key_path:
-            server_public_key = parse_server_pubkey(server_key_path)
-            client_public, client_secret = zmq.curve_keypair()
-            sub.setsockopt(zmq.CURVE_SERVERKEY, server_public_key)
-            sub.setsockopt(zmq.CURVE_PUBLICKEY, client_public)
-            sub.setsockopt(zmq.CURVE_SECRETKEY, client_secret)
-        for ep in endpoints:
-            sub.bind(ep)
-            print(f"  Listening on {ep} (bind mode)", file=sys.stderr)
+    while running:
+        try:
+            frames = sub.recv_multipart()
+        except zmq.Again:
+            continue
+        except zmq.ZMQError:
+            break
+        _process_zmq_message(frames, pcap_file, use_gps)
 
-        while running:
-            try:
-                frames = sub.recv_multipart()
-            except zmq.Again:
-                continue
-            except zmq.ZMQError:
-                break
-            _process_zmq_message(frames, pcap_file, use_gps)
-
-        sub.close()
-    else:
-        # Connect mode: one socket per endpoint for sensor identification
-        poller = zmq.Poller()
-        sockets = {}  # socket -> endpoint label
-        for ep in endpoints:
-            sub = ctx.socket(zmq.SUB)
-            sub.setsockopt(zmq.SUBSCRIBE, b"")
-            sub.setsockopt(zmq.RCVTIMEO, 1000)
-            if server_key_path:
-                server_public_key = parse_server_pubkey(server_key_path)
-                client_public, client_secret = zmq.curve_keypair()
-                sub.setsockopt(zmq.CURVE_SERVERKEY, server_public_key)
-                sub.setsockopt(zmq.CURVE_PUBLICKEY, client_public)
-                sub.setsockopt(zmq.CURVE_SECRETKEY, client_secret)
-            sub.connect(ep)
-            sockets[sub] = ep
-            poller.register(sub, zmq.POLLIN)
-            print(f"  Connected to {ep}", file=sys.stderr)
-
-        while running:
-            try:
-                ready = dict(poller.poll(1000))
-            except zmq.ZMQError:
-                break
-
-            for sock, label in sockets.items():
-                if sock not in ready:
-                    continue
-                try:
-                    frames = sock.recv_multipart(zmq.NOBLOCK)
-                except zmq.Again:
-                    continue
-                _process_zmq_message(frames, pcap_file, use_gps,
-                                     fallback_sensor_id=label)
-
-        for sock in sockets:
-            sock.close()
-
+    sub.close()
     ctx.term()
 
 
@@ -2164,6 +2271,77 @@ def parse_server_pubkey(path):
             if line.startswith("public_key="):
                 return line.split("=", 1)[1].encode()
     raise ValueError(f"No public key found in {path}")
+
+
+def control_router_thread(data_port, server_key_path):
+    """ROUTER thread for C2 control channel. Binds on data_port + 1."""
+    control_port = data_port + 1
+    ctx = zmq.Context()
+    router = ctx.socket(zmq.ROUTER)
+
+    if server_key_path:
+        server_public_key = parse_server_pubkey(server_key_path)
+        router.setsockopt(zmq.CURVE_SERVER, 1)
+        # ROUTER is CURVE server -- needs server secret key
+        # For simplicity, read both public and secret from the keyfile
+        with open(server_key_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("secret_key="):
+                    router.setsockopt(zmq.CURVE_SECRETKEY,
+                                      line.split("=", 1)[1].encode())
+                elif line.startswith("public_key=") or line.startswith("server_public_key="):
+                    router.setsockopt(zmq.CURVE_PUBLICKEY,
+                                      line.split("=", 1)[1].encode())
+
+    router.bind(f"tcp://*:{control_port}")
+    print(f"  C2 control: tcp://*:{control_port} (ROUTER)", file=sys.stderr)
+
+    poller = zmq.Poller()
+    poller.register(router, zmq.POLLIN)
+
+    while running:
+        try:
+            ready = dict(poller.poll(1000))
+        except zmq.ZMQError:
+            break
+
+        # Receive heartbeats from sensors
+        if router in ready:
+            try:
+                frames = router.recv_multipart(zmq.NOBLOCK)
+                if len(frames) >= 2:
+                    identity = frames[0]
+                    payload = frames[-1]
+                    try:
+                        msg = json.loads(payload)
+                        msg_type = msg.get("type", "")
+                        if msg_type == "heartbeat":
+                            sensor_id = msg.get("sensor_id",
+                                                identity.decode("utf-8", "replace"))
+                            state.update_sensor_c2(sensor_id, msg)
+                        elif msg_type == "response":
+                            pass  # could log C2 responses
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        pass
+            except zmq.Again:
+                pass
+
+        # Drain command outbox and send via ROUTER
+        while not state.c2_outbox.empty():
+            try:
+                sensor_id_bytes, cmd_bytes = state.c2_outbox.get_nowait()
+                # Find the ROUTER identity for this sensor_id
+                # The sensor's DEALER identity IS the sensor_id string
+                router.send_multipart([sensor_id_bytes, cmd_bytes])
+            except queue.Empty:
+                break
+            except zmq.ZMQError as e:
+                print(f"  C2 send error: {e}", file=sys.stderr)
+                break
+
+    router.close()
+    ctx.term()
 
 
 # ---------------------------------------------------------------------------
@@ -2206,6 +2384,11 @@ button.on { background: #653; border-color: #a75; color: #fa8; }
 .panel.active { display: flex; flex-direction: column; height: calc(100vh - 52px); }
 
 .table-area { flex: 1; overflow: auto; }
+.pager { padding: 4px 8px; background: #252525; border-top: 1px solid #333;
+         display: flex; align-items: center; gap: 8px; font-size: 11px; }
+.pager button:disabled { opacity: 0.3; cursor: default; }
+.pager select { font: 11px monospace; background: #333; color: #ccc; border: 1px solid #555;
+                padding: 1px 4px; }
 
 table { width: 100%; border-collapse: collapse; }
 thead { position: sticky; top: 0; z-index: 2; }
@@ -2264,6 +2447,17 @@ td[data-col="rssi"] { font-family: 'Menlo', 'Monaco', 'Courier New', monospace; 
            font-size: 9px; border: 1px solid #333; }
 .export-bar { padding: 4px 8px; background: #202020; border-top: 1px solid #333;
               display: flex; gap: 8px; align-items: center; font-size: 11px; }
+/* Nodes panel */
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; }
+.dot-online { background: #4c4; }
+.dot-stale { background: #cc4; }
+.dot-offline { background: #c44; }
+.node-ctrl { display: flex; align-items: center; gap: 6px; }
+.node-ctrl input[type=range] { width: 80px; accent-color: #68f; }
+.node-ctrl input[type=number] { width: 60px; font: 11px monospace; background: #333;
+  color: #ccc; border: 1px solid #555; padding: 1px 3px; }
+.node-ctrl button { font-size: 10px; padding: 1px 6px; }
+.node-ctrl .val-label { font-size: 10px; color: #888; min-width: 30px; text-align: right; }
 @media (max-width: 900px) {
   .summary-grid { grid-template-columns: 1fr; }
   .summary-card.wide, .summary-card.full { grid-column: span 1; }
@@ -2280,11 +2474,15 @@ td[data-col="rssi"] { font-family: 'Menlo', 'Monaco', 'Courier New', monospace; 
     <div class="tab" data-tab="summary" onclick="switchTab('summary')">summary</div>
     <div class="tab" data-tab="sdr" onclick="switchTab('sdr')">sdr</div>
     <div class="tab" data-tab="alerts" onclick="switchTab('alerts')">alerts</div>
+    <div class="tab" data-tab="nodes" onclick="switchTab('nodes')">nodes</div>
   </div>
-  <select class="filter" id="protoFilter" onchange="renderDevices()" title="Protocol filter">
+  <select class="filter" id="protoFilter" onchange="curPage=1;renderDevices()" title="Protocol filter">
     <option value="all">all</option>
     <option value="BLE">BLE only</option>
     <option value="BT">BT only</option>
+  </select>
+  <select class="filter" id="sensorFilter" onchange="curPage=1;renderDevices()" title="Sensor filter">
+    <option value="all">all sensors</option>
   </select>
   <span class="spacer"></span>
   <button onclick="location.href='/api/export.csv'">export CSV</button>
@@ -2326,6 +2524,16 @@ td[data-col="rssi"] { font-family: 'Menlo', 'Monaco', 'Courier New', monospace; 
       <tbody id="tb"></tbody>
     </table>
     <div class="empty" id="empty">waiting for devices...</div>
+    <div class="pager" id="pager" style="display:none">
+      <button id="pgPrev" onclick="curPage--;renderDevices()">&laquo; prev</button>
+      <span id="pgInfo" class="dim"></span>
+      <button id="pgNext" onclick="curPage++;renderDevices()">next &raquo;</button>
+      <select id="pgSize" onchange="pageSize=+this.value;curPage=1;renderDevices()" title="Devices per page">
+        <option value="25">25</option>
+        <option value="50" selected>50</option>
+        <option value="100">100</option>
+      </select>
+    </div>
   </div>
 </div>
 
@@ -2398,6 +2606,29 @@ td[data-col="rssi"] { font-family: 'Menlo', 'Monaco', 'Courier New', monospace; 
   </div>
 </div>
 
+<div class="panel" id="panelNodes">
+  <div class="table-area">
+    <table>
+      <thead><tr>
+        <th>status</th>
+        <th>sensor</th>
+        <th>sdr</th>
+        <th>freq (MHz)</th>
+        <th>channels</th>
+        <th>gain</th>
+        <th>squelch</th>
+        <th>pkt rate</th>
+        <th>crc %</th>
+        <th>uptime</th>
+        <th>gps</th>
+        <th>controls</th>
+      </tr></thead>
+      <tbody id="nodesTb"></tbody>
+    </table>
+    <div class="empty" id="nodesEmpty">no sensor nodes connected</div>
+  </div>
+</div>
+
 <script>
 let priv = true, map = null, marker = null, trail = [], curTab = 'devices';
 let sortCol = 'last', sortAsc = false;
@@ -2405,6 +2636,8 @@ const GPS = __GPS_ENABLED__;
 const tb = document.getElementById('tb');
 let devices = [], summary = null;
 let alertLog = [], alertSettings = {active: false, alert_new: false, cooldown: 300};
+let curPage = 1, pageSize = 50;
+let knownSensors = new Set();
 
 function switchTab(name) {
   curTab = name;
@@ -2774,6 +3007,7 @@ document.querySelectorAll('th[data-col]').forEach(th => {
     const col = th.dataset.col;
     if (sortCol === col) { sortAsc = !sortAsc; }
     else { sortCol = col; sortAsc = false; }
+    curPage = 1;
     document.querySelectorAll('th').forEach(h => { h.classList.remove('sorted','asc'); });
     th.classList.add('sorted');
     if (sortAsc) th.classList.add('asc');
@@ -2856,17 +3090,61 @@ function btMacLabel(d) {
   return d.mac;
 }
 
+function updateSensorFilter() {
+  // Collect all sensor IDs from device data
+  for (const d of devices) {
+    if (d.sensor_ids) d.sensor_ids.forEach(s => knownSensors.add(s));
+  }
+  const sel = document.getElementById('sensorFilter');
+  const cur = sel.value;
+  const opts = ['all', ...Array.from(knownSensors).sort()];
+  if (sel.options.length !== opts.length) {
+    sel.innerHTML = '';
+    for (const o of opts) {
+      const opt = document.createElement('option');
+      opt.value = o;
+      opt.textContent = o === 'all' ? 'all sensors' : o;
+      sel.appendChild(opt);
+    }
+    sel.value = cur && opts.includes(cur) ? cur : 'all';
+  }
+}
+
 function renderDevices() {
+  updateSensorFilter();
   const now = Date.now() / 1000;
   const pf = document.getElementById('protoFilter').value;
+  const sf = document.getElementById('sensorFilter').value;
   let filtered = devices;
-  if (pf !== 'all') filtered = devices.filter(d => (d.protocol||'BLE') === pf);
+  if (pf !== 'all') filtered = filtered.filter(d => (d.protocol||'BLE') === pf);
+  if (sf !== 'all') filtered = filtered.filter(d => d.sensor_ids && d.sensor_ids.includes(sf));
   const sorted = sortDevices(filtered);
   document.getElementById('empty').style.display = sorted.length ? 'none' : 'block';
 
   document.getElementById('sWatched').textContent = watched.size;
+  // Pagination
+  const totalPages = Math.max(1, Math.ceil(sorted.length / pageSize));
+  if (curPage > totalPages) curPage = totalPages;
+  if (curPage < 1) curPage = 1;
+  const start = (curPage - 1) * pageSize;
+  const page = sorted.slice(start, start + pageSize);
+
+  const pager = document.getElementById('pager');
+  if (sorted.length > pageSize) {
+    pager.style.display = 'flex';
+    document.getElementById('pgPrev').disabled = curPage <= 1;
+    document.getElementById('pgNext').disabled = curPage >= totalPages;
+    document.getElementById('pgInfo').textContent =
+      (start+1)+'-'+Math.min(start+pageSize, sorted.length)+' of '+sorted.length+' devices (page '+curPage+'/'+totalPages+')';
+  } else {
+    pager.style.display = sorted.length ? 'flex' : 'none';
+    document.getElementById('pgPrev').disabled = true;
+    document.getElementById('pgNext').disabled = true;
+    document.getElementById('pgInfo').textContent = sorted.length+' devices';
+  }
+
   const frag = document.createDocumentFragment();
-  for (const d of sorted) {
+  for (const d of page) {
     const tr = document.createElement('tr');
     const fresh = (now - d.last) < 3;
     const isWatched = watched.has(d.mac);
@@ -3175,16 +3453,138 @@ function toggleWatch(mac) {
   }).catch(()=>{});
 }
 
+/* --- Nodes tab --- */
+let nodesData = [];
+let nodesDragging = false;
+
+function c2Post(endpoint, body) {
+  fetch(endpoint, {
+    method: 'POST',
+    body: JSON.stringify(body),
+    headers: {'Content-Type': 'application/json'}
+  }).catch(()=>{});
+}
+
+function c2SetGain(sensorId, sdr, val, which) {
+  const body = {sensor_id: sensorId};
+  if (sdr === 'hackrf') {
+    body[which] = parseInt(val);
+  } else {
+    body.gain = parseFloat(val);
+  }
+  c2Post('/api/c2/set_gain', body);
+}
+
+function c2SetSquelch(sensorId, val) {
+  c2Post('/api/c2/set_squelch', {sensor_id: sensorId, threshold: parseFloat(val)});
+}
+
+function c2Restart(sensorId) {
+  const freqEl = document.getElementById('restart-freq-'+sensorId);
+  const chEl = document.getElementById('restart-ch-'+sensorId);
+  const params = {sensor_id: sensorId};
+  if (freqEl && freqEl.value) params.center_freq = parseInt(freqEl.value);
+  if (chEl && chEl.value) params.channels = parseInt(chEl.value);
+  if (!confirm('Restart sensor "'+sensorId+'"? This will briefly disconnect it.')) return;
+  c2Post('/api/c2/restart', params);
+}
+
+function c2GetStatus(sensorId) {
+  c2Post('/api/c2/get_status', {sensor_id: sensorId});
+}
+
+/* Show slider value live while dragging (label next to slider) */
+function sliderPreview(el, labelId) {
+  const lbl = labelId ? document.getElementById(labelId) : el.nextElementSibling;
+  if (lbl) lbl.textContent = el.value;
+}
+
+function renderNodes() {
+  if (nodesDragging) return;  /* don't clobber sliders mid-drag */
+  const ntb = document.getElementById('nodesTb');
+  const empty = document.getElementById('nodesEmpty');
+  if (!nodesData.length) { ntb.innerHTML = ''; empty.style.display = 'block'; return; }
+  empty.style.display = 'none';
+  const frag = document.createDocumentFragment();
+  for (const n of nodesData) {
+    const tr = document.createElement('tr');
+    const dotCls = n.status === 'online' ? 'dot-online' : n.status === 'stale' ? 'dot-stale' : 'dot-offline';
+    const gps = (n.lat != null && n.lon != null) ? n.lat.toFixed(4)+', '+n.lon.toFixed(4) : '-';
+    const rate = n.pkt_rate != null ? n.pkt_rate.toFixed(1) : '-';
+    const crc = n.crc_pct != null ? n.crc_pct.toFixed(1)+'%' : '-';
+    const up = n.uptime != null ? fmtUp(n.uptime) : '-';
+    let gainHtml = '-';
+    if (n.has_c2 && n.gain != null) {
+      const sid = n.id.replace(/[^a-zA-Z0-9_-]/g,'_');
+      if (n.sdr === 'hackrf' && n.gain.lna != null) {
+        gainHtml = '<div class="node-ctrl">' +
+          'LNA <input type="range" min="0" max="40" step="8" value="'+n.gain.lna+'" ' +
+          'oninput="sliderPreview(this,\'gl-'+sid+'\')" ' +
+          'onmousedown="nodesDragging=true" ontouchstart="nodesDragging=true" ' +
+          'onchange="nodesDragging=false;c2SetGain(\''+n.id+'\',\'hackrf\',this.value,\'lna\')">' +
+          '<span class="val-label" id="gl-'+sid+'">'+n.gain.lna+'</span>' +
+          'VGA <input type="range" min="0" max="62" step="2" value="'+n.gain.vga+'" ' +
+          'oninput="sliderPreview(this,\'gv-'+sid+'\')" ' +
+          'onmousedown="nodesDragging=true" ontouchstart="nodesDragging=true" ' +
+          'onchange="nodesDragging=false;c2SetGain(\''+n.id+'\',\'hackrf\',this.value,\'vga\')">' +
+          '<span class="val-label" id="gv-'+sid+'">'+n.gain.vga+'</span></div>';
+      } else {
+        const gv = n.gain.value != null ? n.gain.value : n.gain;
+        gainHtml = '<div class="node-ctrl">' +
+          '<input type="range" min="0" max="76" step="1" value="'+gv+'" ' +
+          'oninput="sliderPreview(this)" ' +
+          'onmousedown="nodesDragging=true" ontouchstart="nodesDragging=true" ' +
+          'onchange="nodesDragging=false;c2SetGain(\''+n.id+'\',\''+n.sdr+'\',this.value,\'gain\')">' +
+          '<span class="val-label">'+gv+'</span></div>';
+      }
+    }
+    let sqlHtml = '-';
+    if (n.has_c2 && n.squelch != null) {
+      sqlHtml = '<div class="node-ctrl">' +
+        '<input type="range" min="-80" max="-10" step="1" value="'+n.squelch+'" ' +
+        'oninput="sliderPreview(this)" ' +
+        'onmousedown="nodesDragging=true" ontouchstart="nodesDragging=true" ' +
+        'onchange="nodesDragging=false;c2SetSquelch(\''+n.id+'\',this.value)">' +
+        '<span class="val-label">'+n.squelch+'</span></div>';
+    }
+    let ctrlHtml = '';
+    if (n.has_c2) {
+      const sid = n.id.replace(/[^a-zA-Z0-9_-]/g,'_');
+      ctrlHtml = '<div class="node-ctrl">' +
+        '<input type="number" id="restart-freq-'+sid+'" placeholder="freq" value="'+(n.center_freq||'')+'" style="width:55px" onfocus="nodesDragging=true" onblur="nodesDragging=false">' +
+        '<input type="number" id="restart-ch-'+sid+'" placeholder="ch" value="'+(n.channels||'')+'" style="width:40px" onfocus="nodesDragging=true" onblur="nodesDragging=false">' +
+        '<button onclick="c2Restart(\''+n.id+'\')" style="color:#f88">restart</button>' +
+        '<button onclick="c2GetStatus(\''+n.id+'\')">refresh</button></div>';
+    }
+    tr.innerHTML =
+      '<td><span class="dot '+dotCls+'"></span>'+n.status+'</td>' +
+      '<td>'+n.id+'</td>' +
+      '<td>'+(n.sdr||'-')+'</td>' +
+      '<td>'+(n.center_freq||'-')+'</td>' +
+      '<td>'+(n.channels||'-')+'</td>' +
+      '<td>'+gainHtml+'</td>' +
+      '<td>'+sqlHtml+'</td>' +
+      '<td>'+rate+'</td>' +
+      '<td>'+crc+'</td>' +
+      '<td>'+up+'</td>' +
+      '<td class="dim">'+gps+'</td>' +
+      '<td>'+ctrlHtml+'</td>';
+    frag.appendChild(tr);
+  }
+  ntb.innerHTML = '';
+  ntb.appendChild(frag);
+}
+
 es.addEventListener('update', e => {
   const d = JSON.parse(e.data);
   devices = d.devices;
   summary = d.summary;
-  // Sync watch state from server — source of truth for persistence across refreshes
   watched.clear();
-  for (const dev of devices) { if (dev.is_watched) watched.add(dev.mac); }
+  if (d.nodes) nodesData = d.nodes;
   updStats(d.stats);
   renderDevices();
   if (curTab === 'summary') renderSummary(summary);
+  if (curTab === 'nodes') renderNodes();
   if (d.sensors && map) updateSensors(d.sensors);
   if (devices && map) updateDevicePositions(devices);
   // Browser alerts
@@ -3228,8 +3628,6 @@ def main():
                         help="Enable GPS column and map display")
     parser.add_argument("--server-key", metavar="FILE",
                         help="Server public key file for CURVE encryption")
-    parser.add_argument("--bind", action="store_true",
-                        help="Bind SUB socket (sensors connect to us) instead of connecting")
     parser.add_argument("--update-bt-db", action="store_true",
                         help="Download/update Bluetooth numbers database from Nordic Semiconductor, then run")
     parser.add_argument("--irk-file", metavar="FILE",
@@ -3342,10 +3740,24 @@ def main():
     # Start ZMQ receiver thread
     zmq_thread = threading.Thread(
         target=zmq_receiver,
-        args=(args.endpoints, args.server_key, pcap_file, args.gps, args.bind),
+        args=(args.endpoints, args.server_key, pcap_file, args.gps),
         daemon=True,
     )
     zmq_thread.start()
+
+    # Start C2 ROUTER thread (control port = data port + 1)
+    try:
+        ep = args.endpoints[0]
+        parsed = urlparse(ep.replace("tcp://", "http://"))
+        c2_port = (parsed.port or 5555) + 1
+    except Exception:
+        c2_port = 5556
+    c2_thread = threading.Thread(
+        target=control_router_thread,
+        args=(c2_port - 1, args.server_key),
+        daemon=True,
+    )
+    c2_thread.start()
 
     # Start HTTP server
     httpd = ThreadingHTTPServer(("0.0.0.0", args.port), DashboardHandler)
@@ -3369,6 +3781,8 @@ def main():
     if static_positions:
         for label, (lat, lon) in static_positions.items():
             print(f"  Sensor pos: {label} ({lat}, {lon})", file=sys.stderr)
+    print(f"  C2 control: tcp://*:{c2_port} (ROUTER, sensors connect here)",
+          file=sys.stderr)
     print(f"  {'='*40}\n", file=sys.stderr)
 
     try:
@@ -3380,6 +3794,7 @@ def main():
     running = False
     print("\nShutting down...", file=sys.stderr)
     zmq_thread.join(timeout=3)
+    c2_thread.join(timeout=3)
     httpd.server_close()
 
     if pcap_file:

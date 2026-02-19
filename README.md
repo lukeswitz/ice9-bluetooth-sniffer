@@ -94,8 +94,7 @@ Optional:
     -v, --verbose           Print detailed info about captured bursts
     -I, --install           Install into Wireshark extcap folder
     -G, --gpsd              Tag packets with GPS coordinates from gpsd
-    -Z, --zmq-pub=ENDPOINT  Publish packets via ZMQ PUB bind socket
-    -X, --zmq-connect=ENDPOINT  Publish via ZMQ PUB connect (collector mode)
+    -Z, --zmq=ENDPOINT     Stream packets to collector (e.g. tcp://collector:5555)
     -K, --zmq-curve-key=FILE  Enable CURVE encryption (requires key file)
         --sensor-id=NAME      Sensor identity for multi-sensor deployments
 ```
@@ -124,12 +123,12 @@ Read from a previously recorded IQ file:
 
 Stream packets over ZMQ to a remote collector:
 
-    ice9-bluetooth -l -c 2441 -C 40 --zmq-pub tcp://*:5555
+    ice9-bluetooth -l -c 2441 -C 40 --zmq tcp://collector:5555
 
 Stream with CURVE encryption:
 
     python3 tools/zmq_keygen.py server.key
-    ice9-bluetooth -l -c 2441 -C 40 --zmq-pub tcp://*:5555 --zmq-curve-key server.key
+    ice9-bluetooth -l -c 2441 -C 40 --zmq tcp://collector:5555 --zmq-curve-key server.key
 
 ### Channel Count Guidelines
 
@@ -229,38 +228,83 @@ AGC headroom) and Intel UHD integrated graphics (~98% realtime at 48 channels).
 
 ### ZMQ Packet Streaming
 
-When built with libzmq, the `--zmq-pub` flag publishes each captured BLE
-packet over a ZMQ PUB socket. Each message is a raw PCAP record (packet
-header + BLE RF Info header + payload), the same bytes written to a PCAP
-file. This enables distributed sensor deployments, remote monitoring,
-and custom processing pipelines.
+When built with libzmq, the `--zmq` flag streams each captured BLE/BT
+packet over a ZMQ PUB socket to a central collector. Each message is a
+raw PCAP record (packet header + RF Info header + payload). Sensors
+always connect out to the collector; the collector (dashboard or
+subscriber) binds and listens. A C2 control channel is automatically
+established on data_port + 1 for remote sensor management.
 
-A Python subscriber is included in `tools/zmq_subscriber.py`:
+    # Collector (dashboard) -- binds on port 5555, C2 on 5556:
+    python3 tools/zmq_web_dashboard.py tcp://*:5555
+
+    # Sensor(s) -- connect to the collector:
+    ice9-bluetooth -l -c 2441 -C 40 --zmq tcp://collector:5555
+    ice9-bluetooth -l -c 2441 -C 40 --zmq tcp://collector:5555 --sensor-id roof
+
+A lightweight subscriber is also included in `tools/zmq_subscriber.py`:
 
     # Receive and display packets:
-    python3 tools/zmq_subscriber.py tcp://sensor:5555
+    python3 tools/zmq_subscriber.py tcp://*:5555
 
     # Write received packets to a PCAP file:
-    python3 tools/zmq_subscriber.py tcp://sensor:5555 -w output.pcap
-
-    # Subscribe to multiple sensors:
-    python3 tools/zmq_subscriber.py tcp://sensor1:5555 tcp://sensor2:5555
+    python3 tools/zmq_subscriber.py tcp://*:5555 -w output.pcap
 
 **CURVE Encryption:** Streams can be encrypted using CurveZMQ
-(Curve25519 + ChaCha20-Poly1305). Generate a keypair, give the server
-key to the sniffer and the public key to subscribers:
+(Curve25519 + ChaCha20-Poly1305). Generate a keypair and distribute:
 
     python3 tools/zmq_keygen.py server.key
-    # server.key      -> sniffer (keep secret)
-    # server.key.pub  -> subscribers (distribute)
+    # server.key      -> both sniffer and collector (keep secret)
+    # server.key.pub  -> not needed separately (key is in server.key)
 
-    # Sniffer:
-    ice9-bluetooth -l ... --zmq-pub tcp://*:5555 --zmq-curve-key server.key
+    # Sensor:
+    ice9-bluetooth -l ... --zmq tcp://collector:5555 --zmq-curve-key server.key
 
-    # Subscriber:
-    python3 tools/zmq_subscriber.py tcp://sensor:5555 --server-key server.key.pub
+    # Collector:
+    python3 tools/zmq_web_dashboard.py tcp://*:5555 --server-key server.key
 
 Requires pyzmq built with libsodium for CURVE support (`pip install pyzmq`).
+
+### Sensor C2 (Command and Control)
+
+When sensors connect to the dashboard via `--zmq`, a bidirectional C2
+control channel is automatically established on data_port + 1 (e.g. port
+5556 when data streams on 5555). No additional flags are needed.
+
+**Heartbeat monitoring:** Each sensor sends a JSON heartbeat every 5 seconds
+containing SDR type, gain, squelch, packet rate, CRC percentage, uptime,
+and GPS position. The dashboard tracks sensor status:
+- **Online** (green): heartbeat received within 15 seconds
+- **Stale** (yellow): heartbeat between 15 and 60 seconds old
+- **Offline** (red): no heartbeat for 60+ seconds
+
+**Runtime-tunable parameters:**
+- **SDR gain**: adjustable via the Nodes tab slider. HackRF exposes LNA
+  (0-40, step 8) and VGA (0-62, step 2) separately; other SDRs have a
+  single gain control.
+- **Squelch threshold**: adjustable via slider (-80 to -10 dB)
+
+**Restart-required parameters:**
+- **Center frequency** and **channel count** require rebuilding the polyphase
+  channelizer, so the sensor restarts itself (via `execv`) when these are
+  changed from the dashboard. The sensor reconnects automatically after
+  restart.
+
+**Dashboard Nodes tab:** shows all connected sensors with live status,
+current gain/squelch values, packet rate, CRC percentage, uptime, GPS
+coordinates, and controls for adjusting parameters or triggering a restart.
+
+    # Start dashboard (binds data on 5555, C2 on 5556):
+    python3 tools/zmq_web_dashboard.py tcp://*:5555
+
+    # Start sensors with distinct IDs:
+    ice9-bluetooth -l -c 2441 -C 60 --zmq tcp://dashboard:5555 --sensor-id roof
+    ice9-bluetooth -l -c 2441 -C 40 --zmq tcp://dashboard:5555 --sensor-id lobby
+
+    # Open http://localhost:8099 -> Nodes tab to monitor and control sensors
+
+CURVE encryption applies to the C2 channel as well -- both the DEALER
+(sensor) and ROUTER (dashboard) use the same keypair.
 
 ### Web Dashboard
 
@@ -271,12 +315,12 @@ summaries.
 
 **Quick start:**
 
-    # Start the sniffer with ZMQ streaming and CRC validation:
-    ice9-bluetooth -l -c 2441 -C 40 --zmq-pub tcp://*:5555 --check-crc -s
+    # Start the dashboard (binds on port 5555, C2 on 5556):
+    pip install pyzmq   # required dependency (cryptography also needed for --irk-file)
+    python3 tools/zmq_web_dashboard.py tcp://*:5555
 
-    # In another terminal, start the dashboard:
-    pip install pyzmq   # only dependency
-    python3 tools/zmq_web_dashboard.py tcp://localhost:5555
+    # Start sensor(s) -- connect to the dashboard:
+    ice9-bluetooth -l -c 2441 -C 40 --zmq tcp://dashboard:5555 --check-crc -s
 
     # Open http://localhost:8099 in a browser
 
@@ -333,8 +377,7 @@ python3 tools/zmq_web_dashboard.py [endpoints...] [options]
   -p, --port PORT           HTTP port (default: 8099)
   -w, --write FILE          Also write packets to PCAP file
   --gps                     Enable GPS column and map display
-  --server-key FILE         Server public key for CURVE encryption
-  --bind                    Bind SUB socket instead of connecting
+  --server-key FILE         Server key file for CURVE encryption
   --update-bt-db            Download/refresh Bluetooth numbers database
   --irk-file FILE           File of IRKs for RPA resolution (label:hex per line)
   --sensor-pos LABEL:LAT,LON  Static sensor position (repeatable)
@@ -351,11 +394,10 @@ python3 tools/zmq_web_dashboard.py [endpoints...] [options]
 **Examples:**
 
     # Dashboard with GPS and PCAP recording:
-    python3 tools/zmq_web_dashboard.py tcp://sensor:5555 --gps -w capture.pcap
+    python3 tools/zmq_web_dashboard.py tcp://*:5555 --gps -w capture.pcap
 
-    # Multiple sensors with encryption:
-    python3 tools/zmq_web_dashboard.py tcp://sensor1:5555 tcp://sensor2:5555 \
-        --server-key server.key.pub
+    # Dashboard with encryption:
+    python3 tools/zmq_web_dashboard.py tcp://*:5555 --server-key server.key
 
     # Update Bluetooth device database (downloads latest from Nordic Semiconductor):
     python3 tools/zmq_web_dashboard.py tcp://localhost:5555 --update-bt-db
@@ -402,10 +444,10 @@ Information) header format, compatible with Wireshark and Kismet.
     sudo gpsd /dev/ttyUSB0 -F /var/run/gpsd.sock
 
     # Capture with GPS tagging:
-    ice9-bluetooth -l -c 2441 -C 40 --gpsd --zmq-pub tcp://*:5555 --check-crc
+    ice9-bluetooth -l -c 2441 -C 40 --gpsd --zmq tcp://collector:5555 --check-crc
 
     # Dashboard with GPS map:
-    python3 tools/zmq_web_dashboard.py tcp://localhost:5555 --gps
+    python3 tools/zmq_web_dashboard.py tcp://*:5555 --gps
 
 The `--gps` flag on the web dashboard enables a live map tab showing device
 locations. GPS fixes are polled from gpsd at 1 Hz with a local cache to

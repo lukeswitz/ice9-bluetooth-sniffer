@@ -207,6 +207,14 @@ void *usrp_stream_thread(void *arg) {
     return NULL;
 }
 
+int usrp_set_gain_runtime(void *dev, double gain) {
+    uhd_usrp_handle usrp = (uhd_usrp_handle)dev;
+    uhd_error err = uhd_usrp_set_rx_gain(usrp, gain, 0, "");
+    if (err == UHD_ERROR_NONE)
+        usrp_gain_val = (float)gain;
+    return err != UHD_ERROR_NONE ? -1 : 0;
+}
+
 void usrp_close(uhd_usrp_handle usrp) {
     uhd_usrp_free(&usrp);
 }

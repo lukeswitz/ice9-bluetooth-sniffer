@@ -60,6 +60,22 @@ hackrf_device *hackrf_setup(void) {
     return hackrf;
 }
 
+int hackrf_set_gain_runtime(void *dev, int new_lna, int new_vga) {
+    hackrf_device *hackrf = (hackrf_device *)dev;
+    int r;
+    if (new_lna >= 0) {
+        r = hackrf_set_lna_gain(hackrf, new_lna);
+        if (r != HACKRF_SUCCESS) return -1;
+        lna_gain = new_lna;
+    }
+    if (new_vga >= 0) {
+        r = hackrf_set_vga_gain(hackrf, new_vga);
+        if (r != HACKRF_SUCCESS) return -1;
+        vga_gain = new_vga;
+    }
+    return 0;
+}
+
 int hackrf_rx_cb(hackrf_transfer *t) {
     unsigned i;
     sample_buf_t *s = malloc(sizeof(*s) + t->valid_length * 4);

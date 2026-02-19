@@ -14,7 +14,7 @@
 #include "burst_catcher.h"
 
 float sql = -45.0f; // agc squelch
-float bt = 0.25f; // agc bandwidth
+const float bt = 0.25f; // agc bandwidth
 
 // starting size of burst buffer in floats
 #define BURST_START_SIZE 2048
@@ -96,6 +96,6 @@ void burst_destroy(burst_t *b) {
     b->packet.bits = NULL;
 }
 
-void burst_catcher_set_squelch(burst_catcher_t *c, float squelch_db) {
-    agc_crcf_squelch_set_threshold(c->agc, squelch_db);
+void burst_catcher_set_squelch(burst_catcher_t *c, float threshold) {
+    agc_crcf_squelch_set_threshold(c->agc, threshold);
 }

@@ -35,6 +35,9 @@
 #ifdef HAVE_GPS
 #include "gps_tag.h"
 #endif
+#ifdef HAVE_ZMQ
+#include "control.h"
+#endif
 
 #include "pfbch2.h"
 
@@ -76,10 +79,12 @@ int stats = 0;
 int check_crc = 0;
 #ifdef HAVE_ZMQ
 int zmq_pub_active = 0;
-int zmq_connect_mode = 0;
 char *zmq_endpoint = NULL;
 char *zmq_curve_keyfile = NULL;
 char *sensor_id = NULL;
+pthread_t control_thread;
+int restart_requested = 0;
+char **restart_argv = NULL;
 #endif
 #ifdef HAVE_GPS
 int gpsd_active = 0;
@@ -547,6 +552,15 @@ out:
     return NULL;
 }
 
+#ifdef HAVE_ZMQ
+void set_all_squelch(float threshold) {
+    unsigned i;
+    sql = threshold;
+    for (i = first_live; i <= last_live; ++i)
+        burst_catcher_set_squelch(&catcher[i], threshold);
+}
+#endif
+
 void init_threads(int launch_spewer) {
     uintptr_t i;
     unsigned active_channels = 0;
@@ -646,13 +660,16 @@ int main(int argc, char **argv) {
     // enables , separator in printf
     setlocale(LC_NUMERIC, "");
 
+#ifdef HAVE_ZMQ
+    control_save_argv(argc, argv);
+#endif
+
     parse_options(argc, argv);
 
 #ifdef HAVE_ZMQ
     if (zmq_pub_active) {
-        if (zmq_pub_init(zmq_endpoint, zmq_curve_keyfile, zmq_connect_mode) != 0)
-            errx(1, "Failed to %s ZMQ PUB socket on %s",
-                 zmq_connect_mode ? "connect" : "bind", zmq_endpoint);
+        if (zmq_pub_init(zmq_endpoint, zmq_curve_keyfile) != 0)
+            errx(1, "Failed to connect ZMQ PUB socket to %s", zmq_endpoint);
         if (sensor_id == NULL) {
             sensor_id = malloc(256);
             if (gethostname(sensor_id, 256) != 0)
@@ -661,8 +678,7 @@ int main(int argc, char **argv) {
             if (strlen(sensor_id) == 24)
                 strcat(sensor_id, "-");
         }
-        fprintf(stderr, "ZMQ PUB: %s (%s) sensor-id=%s\n", zmq_endpoint,
-                zmq_connect_mode ? "connect" : "bind", sensor_id);
+        fprintf(stderr, "ZMQ PUB: %s sensor-id=%s\n", zmq_endpoint, sensor_id);
     }
 #endif
 
@@ -755,6 +771,25 @@ int main(int argc, char **argv) {
 
     init_threads(!live);
 
+#ifdef HAVE_ZMQ
+    if (zmq_pub_active) {
+        char *ctrl_ep = control_derive_endpoint(zmq_endpoint);
+        sdr_handle_t sdr = { .type = SDR_NONE, .handle = NULL };
+        if (hackrf != NULL)      { sdr.type = SDR_HACKRF;  sdr.handle = hackrf; }
+        else if (bladerf != NULL) { sdr.type = SDR_BLADERF; sdr.handle = bladerf; }
+        else if (usrp != NULL)    { sdr.type = SDR_USRP;    sdr.handle = usrp; }
+#ifdef HAVE_SOAPYSDR
+        else if (soapy != NULL)   { sdr.type = SDR_SOAPY;   sdr.handle = soapy; }
+#endif
+        control_set_sdr(sdr);
+        if (control_init(ctrl_ep, zmq_curve_keyfile, sensor_id) == 0) {
+            pthread_create(&control_thread, NULL, control_loop, NULL);
+            fprintf(stderr, "C2: control channel connecting to %s\n", ctrl_ep);
+        }
+        free(ctrl_ep);
+    }
+#endif
+
     if (live) {
         if (hackrf != NULL)
             hackrf_start_rx(hackrf, hackrf_rx_cb, NULL);
@@ -817,8 +852,12 @@ int main(int argc, char **argv) {
 #endif
 
 #ifdef HAVE_ZMQ
-    if (zmq_pub_active)
+    if (zmq_pub_active) {
+        control_shutdown();
+        pthread_join(control_thread, NULL);
+        control_close();
         zmq_pub_close();
+    }
     free(zmq_endpoint);
     free(zmq_curve_keyfile);
 #endif
@@ -831,6 +870,19 @@ int main(int argc, char **argv) {
     deinit_vkfft();
 #endif
     pfbch2_release(&magic);
+
+#ifdef HAVE_ZMQ
+    if (restart_requested && restart_argv) {
+        char exe[PATH_MAX];
+        ssize_t len = readlink("/proc/self/exe", exe, PATH_MAX - 1);
+        if (len > 0) {
+            exe[len] = '\0';
+            fprintf(stderr, "C2: restarting with new parameters...\n");
+            execv(exe, restart_argv);
+            perror("execv failed");
+        }
+    }
+#endif
 
     return 0;
 }
