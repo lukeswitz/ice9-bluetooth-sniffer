@@ -1611,12 +1611,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
         else:
             self.send_error(404)
 
+    def _read_post_body(self, max_bytes=65536):
+        length = int(self.headers.get("Content-Length", 0))
+        if length <= 0:
+            return {}
+        if length > max_bytes:
+            return None
+        return json.loads(self.rfile.read(length))
+
     def do_POST(self):
         path = urlparse(self.path).path
         if path == "/api/watch":
             try:
-                length = int(self.headers.get("Content-Length", 0))
-                body = json.loads(self.rfile.read(length))
+                body = self._read_post_body()
+                if body is None:
+                    self.send_error(413)
+                    return
                 mac = body.get("mac", "")
                 watch = body.get("watch", False)
                 if state.alert_mgr:
@@ -1634,8 +1644,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _handle_c2(self, path):
         try:
-            length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(length)) if length > 0 else {}
+            body = self._read_post_body()
+            if body is None:
+                self.send_error(413)
+                return
         except Exception:
             self.send_error(400)
             return
@@ -1648,24 +1660,47 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if path == "/api/c2/set_gain":
             params = {}
             if "gain" in body:
-                params["gain"] = float(body["gain"])
+                g = float(body["gain"])
+                if not (0 <= g <= 100):
+                    self._serve_json({"ok": False, "error": "gain out of range (0-100)"})
+                    return
+                params["gain"] = g
             if "lna" in body:
-                params["lna"] = int(body["lna"])
+                v = int(body["lna"])
+                if not (0 <= v <= 40):
+                    self._serve_json({"ok": False, "error": "lna out of range (0-40)"})
+                    return
+                params["lna"] = v
             if "vga" in body:
-                params["vga"] = int(body["vga"])
+                v = int(body["vga"])
+                if not (0 <= v <= 62):
+                    self._serve_json({"ok": False, "error": "vga out of range (0-62)"})
+                    return
+                params["vga"] = v
             state.send_c2_command(sensor_id, "set_gain", params)
             self._serve_json({"ok": True})
         elif path == "/api/c2/set_squelch":
             threshold = float(body.get("threshold", -45))
+            if not (-100 <= threshold <= -5):
+                self._serve_json({"ok": False, "error": "threshold out of range (-100 to -5)"})
+                return
             state.send_c2_command(sensor_id, "set_squelch",
                                   {"threshold": threshold})
             self._serve_json({"ok": True})
         elif path == "/api/c2/restart":
             params = {}
             if "center_freq" in body:
-                params["center_freq"] = int(body["center_freq"])
+                f = int(body["center_freq"])
+                if not (2400 <= f <= 2500):
+                    self._serve_json({"ok": False, "error": "center_freq out of range (2400-2500 MHz)"})
+                    return
+                params["center_freq"] = f
             if "channels" in body:
-                params["channels"] = int(body["channels"])
+                c = int(body["channels"])
+                if not (1 <= c <= 96):
+                    self._serve_json({"ok": False, "error": "channels out of range (1-96)"})
+                    return
+                params["channels"] = c
             state.send_c2_command(sensor_id, "restart", params)
             self._serve_json({"ok": True})
         elif path == "/api/c2/get_status":
@@ -2222,6 +2257,13 @@ function fmtUp(s) {
   return Math.floor(s/3600)+'h'+Math.floor((s%3600)/60)+'m';
 }
 
+function esc(s) {
+  if (!s) return '';
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
 function ago(ts) {
   const s = (Date.now()/1000) - ts;
   if (s < 2) return 'now';
@@ -2381,9 +2423,9 @@ function renderDevices() {
       `<td>${protoBadge(proto)}</td>`+
       `<td class="${macCls}">${mc}</td>`+
       `<td class="${addrCls(mt)}">${mt}</td>`+
-      `<td>${mfrLabel(d)}</td>`+
-      `<td class="blu">${d.name||''}</td>`+
-      `<td class="dim">${svcLabel(d)}</td>`+
+      `<td>${esc(mfrLabel(d))}</td>`+
+      `<td class="blu">${esc(d.name)}</td>`+
+      `<td class="dim">${esc(svcLabel(d))}</td>`+
       `<td class="${isAdv?'blu':'org'}">${d.type}</td>`+
       `<td>${rssiLabel(d)}</td>`+
       `<td class="dim">${dist}</td>`+
@@ -2412,7 +2454,7 @@ function renderBarChart(containerId, data, color, maxItems) {
   let html = h3;
   for (const [label, count] of items) {
     const pct = max > 0 ? Math.round(100 * count / max) : 0;
-    html += `<div class="bar-row"><span class="bar-label">${label}</span>`+
+    html += `<div class="bar-row"><span class="bar-label">${esc(label)}</span>`+
       `<span class="bar-track"><span class="bar-fill" style="width:${pct}%;background:${color};opacity:0.6"></span></span>`+
       `<span class="bar-val">${count.toLocaleString()}</span></div>`;
   }
@@ -2431,8 +2473,8 @@ function renderTopTalkers(data) {
     const mc = priv ? mask(t.mac) : t.mac;
     const info = [t.mfr, t.name].filter(Boolean).join(' - ') || '';
     html += `<div class="talker-row"><span class="rank">${i+1}</span>`+
-      `<span class="mac ${priv?'masked':''}">${mc}</span>`+
-      `<span class="info">${info}</span>`+
+      `<span class="mac ${priv?'masked':''}">${esc(mc)}</span>`+
+      `<span class="info">${esc(info)}</span>`+
       `<span class="cnt">${t.pkts.toLocaleString()}</span></div>`;
   });
   el.innerHTML = html;
@@ -2707,9 +2749,9 @@ function renderNodes() {
         '<button onclick="c2GetStatus(\''+n.id+'\')">refresh</button></div>';
     }
     tr.innerHTML =
-      '<td><span class="dot '+dotCls+'"></span>'+n.status+'</td>' +
-      '<td>'+n.id+'</td>' +
-      '<td>'+(n.sdr||'-')+'</td>' +
+      '<td><span class="dot '+dotCls+'"></span>'+esc(n.status)+'</td>' +
+      '<td>'+esc(n.id)+'</td>' +
+      '<td>'+esc(n.sdr||'-')+'</td>' +
       '<td>'+(n.center_freq||'-')+'</td>' +
       '<td>'+(n.channels||'-')+'</td>' +
       '<td>'+gainHtml+'</td>' +
