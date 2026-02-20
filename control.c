@@ -185,6 +185,16 @@ void control_close(void) {
         zmq_ctx_destroy(ctrl_ctx);
         ctrl_ctx = NULL;
     }
+    if (saved_argv) {
+        for (int i = 0; i < saved_argc; i++)
+            free(saved_argv[i]);
+        free(saved_argv);
+        saved_argv = NULL;
+    }
+    if (restart_argv) {
+        free(restart_argv);
+        restart_argv = NULL;
+    }
 }
 
 static const char *sdr_type_str(sdr_type_t t) {

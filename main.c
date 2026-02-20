@@ -865,6 +865,8 @@ int main(int argc, char **argv) {
     for (i = first_live; i <= last_live; ++i)
         burst_catcher_destroy(&catcher[i]);
     free(catcher);
+    free(agc_buffers);
+    free(sensor_id);
 
 #ifdef USE_OPENCL_PFB
     deinit_vkfft();

@@ -272,8 +272,8 @@ control channel is automatically established on data_port + 1 (e.g. port
 5556 when data streams on 5555). No additional flags are needed.
 
 **Heartbeat monitoring:** Each sensor sends a JSON heartbeat every 5 seconds
-containing SDR type, gain, squelch, packet rate, CRC percentage, uptime,
-and GPS position. The dashboard tracks sensor status:
+containing SDR type, center frequency, channel count, gain, squelch, packet
+rate, CRC percentage, uptime, and GPS position. The dashboard tracks sensor status:
 - **Online** (green): heartbeat received within 15 seconds
 - **Stale** (yellow): heartbeat between 15 and 60 seconds old
 - **Offline** (red): no heartbeat for 60+ seconds
