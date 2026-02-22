@@ -76,7 +76,7 @@ static void process_nmea_line(const char *line) {
         cached_fix.valid     = (lat[0] != '\0' && lon[0] != '\0') ? 1 : 0;
 
     } else if (strcmp(type, "$GPGGA") == 0 || strcmp(type, "$GNGGA") == 0) {
-        char fix_q[4], lat[16], ns[4], lon[16], ew[4], alt[16];
+        char fix_q[4], lat[16], ns[4], lon[16], ew[4], nsv[4], alt[16];
         nmea_field(line, 6,  fix_q, sizeof(fix_q));
         if (fix_q[0] == '0' || fix_q[0] == '\0') {
             cached_fix.valid = 0;
@@ -86,10 +86,12 @@ static void process_nmea_line(const char *line) {
         nmea_field(line, 3, ns,    sizeof(ns));
         nmea_field(line, 4, lon,   sizeof(lon));
         nmea_field(line, 5, ew,    sizeof(ew));
+        nmea_field(line, 7, nsv,   sizeof(nsv));
         nmea_field(line, 9, alt,   sizeof(alt));
         cached_fix.latitude  = nmea_coord(lat, ns[0]);
         cached_fix.longitude = nmea_coord(lon, ew[0]);
         cached_fix.altitude  = alt[0] ? atof(alt) : 0.0;
+        cached_fix.sats_used = nsv[0] ? atoi(nsv) : 0;
         cached_fix.valid     = (lat[0] != '\0' && lon[0] != '\0') ? 1 : 0;
     }
 }
@@ -194,6 +196,7 @@ void gps_tag_get_fix(gps_fix_t *fix) {
                 cached_fix.longitude = gpsd_state.fix.longitude;
                 cached_fix.altitude  = isfinite(gpsd_state.fix.altMSL)
                                        ? gpsd_state.fix.altMSL : 0.0;
+                cached_fix.sats_used = gpsd_state.satellites_used;
                 cached_fix.valid = 1;
             }
         }

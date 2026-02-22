@@ -1823,14 +1823,18 @@ class DashboardState:
                     n["pkt_rate"] = hb.get("pkt_rate")
                     n["crc_pct"] = hb.get("crc_pct")
                     n["uptime"] = hb.get("uptime")
+                    n["gps_active"] = hb.get("gps_active", False)
                     if hb.get("gps"):
                         n["lat"] = hb["gps"][0]
                         n["lon"] = hb["gps"][1]
+                        n["gps_sats"] = hb["gps"][3] if len(hb["gps"]) > 3 else None
                 else:
                     nodes[sid] = {
                         "id": sid, "status": status, "has_c2": True,
                         "lat": hb.get("gps", [None])[0] if hb.get("gps") else None,
                         "lon": hb.get("gps", [None, None])[1] if hb.get("gps") else None,
+                        "gps_sats": hb["gps"][3] if hb.get("gps") and len(hb["gps"]) > 3 else None,
+                        "gps_active": hb.get("gps_active", False),
                         "pkts": 0, "last_seen": hb.get("last_heartbeat", 0),
                         "sdr": hb.get("sdr"),
                         "center_freq": hb.get("center_freq"),
@@ -3522,7 +3526,12 @@ function renderNodes() {
     const hasGps = n.lat != null && n.lon != null;
     let gpsHtml;
     if (hasGps) {
-      gpsHtml = n.lat.toFixed(4)+', '+n.lon.toFixed(4);
+      const satsStr = (n.gps_sats != null && n.gps_sats > 0) ? ' · '+n.gps_sats+' sats' : '';
+      gpsHtml = '<span class="dot dot-online"></span>' +
+        '<span class="node-st node-st-ok">active'+satsStr+'</span>';
+    } else if (n.gps_active) {
+      gpsHtml = '<span class="dot dot-stale"></span>' +
+        '<span class="node-st node-st-warn">searching...</span>';
     } else if (n.has_c2) {
       const sid = n.id.replace(/[^a-zA-Z0-9_-]/g,'_');
       const opts = serialPorts.length

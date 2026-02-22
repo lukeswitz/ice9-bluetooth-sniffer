@@ -271,6 +271,7 @@ static void send_heartbeat(void) {
 
     /* GPS */
 #ifdef HAVE_GPS
+    cJSON_AddBoolToObject(root, "gps_active", gpsd_active);
     if (gpsd_active) {
         gps_fix_t fix;
         gps_tag_get_fix(&fix);
@@ -279,6 +280,7 @@ static void send_heartbeat(void) {
             cJSON_AddItemToArray(gps, cJSON_CreateNumber(fix.latitude));
             cJSON_AddItemToArray(gps, cJSON_CreateNumber(fix.longitude));
             cJSON_AddItemToArray(gps, cJSON_CreateNumber(fix.altitude));
+            cJSON_AddItemToArray(gps, cJSON_CreateNumber(fix.sats_used));
             cJSON_AddItemToObject(root, "gps", gps);
         }
     }

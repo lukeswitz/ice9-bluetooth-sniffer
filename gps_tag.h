@@ -12,6 +12,7 @@ typedef struct _gps_fix_t {
     double longitude;
     double altitude;
     int valid;          // nonzero if we have a fix
+    int sats_used;      // satellites used in fix (0 if unknown)
 } gps_fix_t;
 
 int gps_tag_init(void);
