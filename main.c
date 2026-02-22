@@ -52,6 +52,9 @@ int8_t *get_next_raw_buffer(void);
 
 // only needed on macOS
 #include "pthread_barrier.h"
+#ifndef __linux__
+#include <mach-o/dyld.h>
+#endif
 
 float samp_rate = 0.f;
 unsigned channels = 96;
@@ -846,6 +849,32 @@ int main(int argc, char **argv) {
     if (zmq_pub_active) {
         control_shutdown();
         pthread_join(control_thread, NULL);
+        /* Attempt restart before control_close() frees restart_argv and saved_argv strings */
+        if (restart_requested && restart_argv) {
+            char exe[PATH_MAX];
+            int got_exe = 0;
+#ifdef __linux__
+            ssize_t len = readlink("/proc/self/exe", exe, PATH_MAX - 1);
+            if (len > 0) {
+                exe[len] = '\0';
+                got_exe = 1;
+            }
+#else
+            {
+                char tmp[PATH_MAX];
+                uint32_t size = (uint32_t)PATH_MAX;
+                if (_NSGetExecutablePath(tmp, &size) == 0 && realpath(tmp, exe) != NULL)
+                    got_exe = 1;
+            }
+#endif
+            if (got_exe) {
+                fprintf(stderr, "C2: restarting with new parameters...\n");
+                execv(exe, restart_argv);
+                perror("execv failed");
+            } else {
+                fprintf(stderr, "C2: restart failed: could not resolve executable path\n");
+            }
+        }
         control_close();
         zmq_pub_close();
     }
@@ -863,19 +892,6 @@ int main(int argc, char **argv) {
     deinit_vkfft();
 #endif
     pfbch2_release(&magic);
-
-#ifdef HAVE_ZMQ
-    if (restart_requested && restart_argv) {
-        char exe[PATH_MAX];
-        ssize_t len = readlink("/proc/self/exe", exe, PATH_MAX - 1);
-        if (len > 0) {
-            exe[len] = '\0';
-            fprintf(stderr, "C2: restarting with new parameters...\n");
-            execv(exe, restart_argv);
-            perror("execv failed");
-        }
-    }
-#endif
 
     return 0;
 }

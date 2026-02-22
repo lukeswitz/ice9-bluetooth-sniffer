@@ -1876,14 +1876,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             params = {}
             if "center_freq" in body:
                 f = int(body["center_freq"])
-                if not (2400 <= f <= 2500):
-                    self._serve_json({"ok": False, "error": "center_freq out of range (2400-2500 MHz)"})
+                if not (2400 <= f <= 2480):
+                    self._serve_json({"ok": False, "error": "center_freq out of range (2400-2480 MHz)"})
                     return
                 params["center_freq"] = f
             if "channels" in body:
                 c = int(body["channels"])
-                if not (1 <= c <= 96):
-                    self._serve_json({"ok": False, "error": "channels out of range (1-96)"})
+                if not (4 <= c <= 96) or c % 4 != 0:
+                    self._serve_json({"ok": False, "error": "channels out of range (4-96, must be divisible by 4)"})
                     return
                 params["channels"] = c
             state.send_c2_command(sensor_id, "restart", params)
@@ -2383,6 +2383,10 @@ td[data-col="rssi"] { font-family: 'Menlo', 'Monaco', 'Courier New', monospace; 
 .node-ctrl input[type=number] { width: 60px; font: 11px monospace; background: #333;
   color: #ccc; border: 1px solid #555; padding: 1px 3px; }
 .node-ctrl button { font-size: 10px; padding: 1px 6px; }
+.node-ctrl button.restart-btn { color: #f88; }
+.node-ctrl button.restart-btn:hover { background: #444; }
+.node-ctrl button.restart-btn.restart-pending { background: #363000; border-color: #665500; color: #cc4; }
+.node-ctrl button.restart-btn.restart-pending:hover { background: #454000; }
 .node-ctrl .val-label { font-size: 10px; color: #888; min-width: 30px; text-align: right; }
 @media (max-width: 900px) {
   .summary-grid { grid-template-columns: 1fr; }
@@ -3273,6 +3277,7 @@ function toggleWatch(mac) {
 let nodesData = [];
 let nodesDragging = false;
 const nodeCtrlStatus = new Map();  /* sensorId -> {msg, cls, timer} */
+const pendingRestart = new Set();  /* sensorIds with unsent freq/ch changes */
 
 function c2Post(endpoint, body) {
   return fetch(endpoint, {
@@ -3303,11 +3308,30 @@ function c2SetGain(sensorId, sdr, val, which) {
   } else {
     body.gain = parseFloat(val);
   }
+  /* Optimistic update so slider holds position until heartbeat confirms */
+  const node = nodesData.find(n => n.id === sensorId);
+  if (node && node.gain) {
+    if (sdr === 'hackrf') {
+      node.gain[which] = parseInt(val);
+    } else {
+      node.gain.value = parseFloat(val);
+    }
+  }
   c2Post('/api/c2/set_gain', body);
 }
 
 function c2SetSquelch(sensorId, val) {
+  /* Optimistic update so slider holds position until heartbeat confirms */
+  const node = nodesData.find(n => n.id === sensorId);
+  if (node) node.squelch = parseFloat(val);
   c2Post('/api/c2/set_squelch', {sensor_id: sensorId, threshold: parseFloat(val)});
+}
+
+function markRestartPending(sensorId) {
+  pendingRestart.add(sensorId);
+  const sid = sensorId.replace(/[^a-zA-Z0-9_-]/g,'_');
+  const btn = document.getElementById('restart-btn-'+sid);
+  if (btn) btn.classList.add('restart-pending');
 }
 
 function c2Restart(sensorId) {
@@ -3317,6 +3341,7 @@ function c2Restart(sensorId) {
   const params = {sensor_id: sensorId};
   if (freqEl && freqEl.value) params.center_freq = parseInt(freqEl.value);
   if (chEl && chEl.value) params.channels = parseInt(chEl.value);
+  pendingRestart.delete(sensorId);
   nodesDragging = false;
   nodeStatus(sensorId, 'restarting...', 'node-st-warn');
   c2Post('/api/c2/restart', params).then(d => {
@@ -3392,10 +3417,16 @@ function renderNodes() {
       const st = nodeCtrlStatus.get(n.id);
       const stMsg = st ? st.msg : '';
       const stCls = st ? ('node-st ' + (st.cls||'')) : 'node-st';
+      /* Preserve any value the user has already typed into these inputs */
+      const prevFreqEl = document.getElementById('restart-freq-'+sid);
+      const prevChEl   = document.getElementById('restart-ch-'+sid);
+      const freqVal = prevFreqEl ? prevFreqEl.value : (n.center_freq || '');
+      const chVal   = prevChEl   ? prevChEl.value   : (n.channels || '');
+      const restartBtnCls = 'restart-btn' + (pendingRestart.has(n.id) ? ' restart-pending' : '');
       ctrlHtml = '<div class="node-ctrl">' +
-        '<input type="number" id="restart-freq-'+sid+'" placeholder="freq" value="'+(n.center_freq||'')+'" style="width:55px" onfocus="nodesDragging=true" onblur="nodesDragging=false">' +
-        '<input type="number" id="restart-ch-'+sid+'" placeholder="ch" value="'+(n.channels||'')+'" style="width:40px" onfocus="nodesDragging=true" onblur="nodesDragging=false">' +
-        '<button onclick="c2Restart(\''+n.id+'\')" style="color:#f88">restart</button>' +
+        '<input type="number" id="restart-freq-'+sid+'" placeholder="freq" title="Center frequency MHz (2400-2480)" min="2400" max="2480" value="'+freqVal+'" style="width:55px" oninput="markRestartPending(\''+n.id+'\')" onfocus="nodesDragging=true" onblur="nodesDragging=false">' +
+        '<input type="number" id="restart-ch-'+sid+'" placeholder="ch" title="Channels (4-96, divisible by 4)" min="4" max="96" step="4" value="'+chVal+'" style="width:40px" oninput="markRestartPending(\''+n.id+'\')" onfocus="nodesDragging=true" onblur="nodesDragging=false">' +
+        '<button id="restart-btn-'+sid+'" class="'+restartBtnCls+'" onclick="c2Restart(\''+n.id+'\')">restart</button>' +
         '<button onclick="c2GetStatus(\''+n.id+'\')">refresh</button>' +
         '<span id="ctrl-st-'+sid+'" class="'+stCls+'">'+stMsg+'</span></div>';
     }
@@ -3423,6 +3454,7 @@ es.addEventListener('update', e => {
   devices = d.devices;
   summary = d.summary;
   watched.clear();
+  for (const dev of (d.devices || [])) { if (dev.is_watched) watched.add(dev.mac); }
   if (d.nodes) nodesData = d.nodes;
   updStats(d.stats);
   renderDevices();
