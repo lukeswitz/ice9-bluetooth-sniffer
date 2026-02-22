@@ -17,9 +17,6 @@ void pcap_write_bt(pcap_t *p, classic_bt_packet_t *bt);
 #ifdef HAVE_ZMQ
 int zmq_pub_init(const char *endpoint, const char *curve_keyfile);
 void zmq_pub_close(void);
-int zmq_control_init(const char *endpoint);
-void *zmq_control_thread(void *arg);
-void zmq_control_close(void);
 #endif
 
 /* ZMQ GPS frame structure (sent as frame 1 of multipart message) */

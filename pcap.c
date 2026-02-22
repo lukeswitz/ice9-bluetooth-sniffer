@@ -33,7 +33,6 @@ extern int gpsd_active;
 static void *zmq_ctx = NULL;
 static void *zmq_pub = NULL;
 extern char *sensor_id;
-static void *zmq_control = NULL;
 extern sig_atomic_t running;
 extern hackrf_device *hackrf_device_global;
 extern struct bladerf *bladerf_device_global;
@@ -45,10 +44,6 @@ extern void **agc_array_global;
 extern unsigned num_agcs_global;
 extern float sql;
 
-// Track initial gain values for distance calculation compensation
-static unsigned initial_vga_gain = 0;
-static unsigned initial_lna_gain = 0;
-static int initial_gain_captured = 0;
 #endif
 
 struct _pcap_t {
@@ -274,132 +269,6 @@ void zmq_pub_close(void) {
         zmq_ctx_destroy(zmq_ctx);
         zmq_ctx = NULL;
     }
-}
-
-int zmq_control_init(const char *endpoint) {
-    if (!zmq_ctx) {
-        zmq_ctx = zmq_ctx_new();
-        if (!zmq_ctx)
-            return -1;
-    }
-    zmq_control = zmq_socket(zmq_ctx, ZMQ_REP);
-    if (!zmq_control)
-        return -1;
-    if (zmq_bind(zmq_control, endpoint) != 0) {
-        zmq_close(zmq_control);
-        zmq_control = NULL;
-        return -1;
-    }
-    return 0;
-}
-
-void zmq_control_close(void) {
-    if (zmq_control) {
-        zmq_close(zmq_control);
-        zmq_control = NULL;
-    }
-}
-
-void *zmq_control_thread(void *arg) {
-    (void)arg;
-    if (!zmq_control)
-        return NULL;
-
-    char buf[256];
-    while (running) {
-        zmq_pollitem_t items[] = {{zmq_control, 0, ZMQ_POLLIN, 0}};
-        int rc = zmq_poll(items, 1, 1000);
-        if (rc <= 0)
-            continue;
-
-        int len = zmq_recv(zmq_control, buf, sizeof(buf) - 1, ZMQ_DONTWAIT);
-        if (len < 0)
-            continue;
-        buf[len] = '\0';
-
-        // Handle "status" command without requiring colon
-        if (strcmp(buf, "status") == 0 || strcmp(buf, "status:") == 0) {
-            // Capture initial gain values on first status request
-            if (!initial_gain_captured) {
-                initial_vga_gain = vga_gain;
-                initial_lna_gain = lna_gain;
-                initial_gain_captured = 1;
-            }
-            float rssi_offset = bluetooth_get_rssi_offset();
-            snprintf(buf, sizeof(buf), "vga=%u lna=%u squelch=%.1f rssi_offset=%.1f vga0=%u lna0=%u",
-                     vga_gain, lna_gain, sql, rssi_offset, initial_vga_gain, initial_lna_gain);
-            zmq_send(zmq_control, buf, strlen(buf), 0);
-            continue;
-        }
-
-        char *colon = strchr(buf, ':');
-        if (!colon) {
-            zmq_send(zmq_control, "ERR invalid_format", 18, 0);
-            continue;
-        }
-
-        *colon = '\0';
-        char *cmd = buf;
-        char *val = colon + 1;
-
-        if (strcmp(cmd, "vga") == 0 || strcmp(cmd, "gain") == 0) {
-            int v = atoi(val);
-            if (hackrf_device_global) {
-                // HackRF VGA: 0-62 in steps of 2 dB
-                v = (v / 2) * 2;
-                if (v < 0) v = 0;
-                if (v > 62) v = 62;
-                hackrf_set_gains(hackrf_device_global, v, lna_gain);
-                zmq_send(zmq_control, "OK", 2, 0);
-            } else if (bladerf_device_global) {
-                bladerf_set_rx_gain(bladerf_device_global, v);
-                zmq_send(zmq_control, "OK", 2, 0);
-            } else if (usrp_device_global) {
-                usrp_set_gain(usrp_device_global, (float)v);
-                zmq_send(zmq_control, "OK", 2, 0);
-#ifdef HAVE_SOAPYSDR
-            } else if (soapy_device_global) {
-                soapy_set_gain(soapy_device_global, (double)v);
-                zmq_send(zmq_control, "OK", 2, 0);
-#endif
-            } else {
-                zmq_send(zmq_control, "ERR no_device", 13, 0);
-            }
-        } else if (strcmp(cmd, "lna") == 0) {
-            int v = atoi(val);
-            if (hackrf_device_global) {
-                // HackRF LNA: only 0, 8, 16, 24, 32, or 40 dB
-                if (v <= 4) v = 0;
-                else if (v <= 12) v = 8;
-                else if (v <= 20) v = 16;
-                else if (v <= 28) v = 24;
-                else if (v <= 36) v = 32;
-                else v = 40;
-                hackrf_set_gains(hackrf_device_global, vga_gain, v);
-                zmq_send(zmq_control, "OK", 2, 0);
-            } else {
-                // Other SDRs don't have separate LNA, ignore
-                zmq_send(zmq_control, "OK", 2, 0);
-            }
-        } else if (strcmp(cmd, "squelch") == 0) {
-            float v = atof(val);
-            sql = v;
-            if (agc_array_global && num_agcs_global > 0) {
-                burst_catcher_t *catcher_array = (burst_catcher_t *)agc_array_global;
-                for (unsigned i = 0; i < num_agcs_global; ++i) {
-                    burst_catcher_t *c = &catcher_array[i];
-                    if (c->agc)
-                        burst_catcher_set_squelch(c, v);
-                }
-                zmq_send(zmq_control, "OK", 2, 0);
-            } else {
-                zmq_send(zmq_control, "ERR no_agc", 10, 0);
-            }
-        } else {
-            zmq_send(zmq_control, "ERR unknown_cmd", 15, 0);
-        }
-    }
-    return NULL;
 }
 
 static void zmq_pub_raw(uint8_t type_byte, pcaprec_hdr_t *ph,

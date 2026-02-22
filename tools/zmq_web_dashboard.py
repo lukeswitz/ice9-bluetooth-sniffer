@@ -2376,6 +2376,10 @@ td[data-col="rssi"] { font-family: 'Menlo', 'Monaco', 'Courier New', monospace; 
 .dot-offline { background: #c44; }
 .node-ctrl { display: flex; align-items: center; gap: 6px; }
 .node-ctrl input[type=range] { width: 80px; accent-color: #68f; }
+.node-st { font-size: 10px; color: #888; min-width: 80px; }
+.node-st-warn { color: #fa8; }
+.node-st-ok { color: #7c4; }
+.node-st-err { color: #c44; }
 .node-ctrl input[type=number] { width: 60px; font: 11px monospace; background: #333;
   color: #ccc; border: 1px solid #555; padding: 1px 3px; }
 .node-ctrl button { font-size: 10px; padding: 1px 6px; }
@@ -3268,13 +3272,28 @@ function toggleWatch(mac) {
 /* --- Nodes tab --- */
 let nodesData = [];
 let nodesDragging = false;
+const nodeCtrlStatus = new Map();  /* sensorId -> {msg, cls, timer} */
 
 function c2Post(endpoint, body) {
-  fetch(endpoint, {
+  return fetch(endpoint, {
     method: 'POST',
     body: JSON.stringify(body),
     headers: {'Content-Type': 'application/json'}
-  }).catch(()=>{});
+  }).then(r => r.json()).catch(() => ({ok: false}));
+}
+
+function nodeStatus(sensorId, msg, cls) {
+  const sid = sensorId.replace(/[^a-zA-Z0-9_-]/g,'_');
+  const el = document.getElementById('ctrl-st-'+sid);
+  if (el) { el.textContent = msg; el.className = 'node-st ' + (cls||''); }
+  const prev = nodeCtrlStatus.get(sensorId);
+  if (prev) clearTimeout(prev.timer);
+  const timer = setTimeout(() => {
+    nodeCtrlStatus.delete(sensorId);
+    const e = document.getElementById('ctrl-st-'+sid);
+    if (e) { e.textContent = ''; e.className = 'node-st'; }
+  }, 3000);
+  nodeCtrlStatus.set(sensorId, {msg, cls, timer});
 }
 
 function c2SetGain(sensorId, sdr, val, which) {
@@ -3298,12 +3317,19 @@ function c2Restart(sensorId) {
   const params = {sensor_id: sensorId};
   if (freqEl && freqEl.value) params.center_freq = parseInt(freqEl.value);
   if (chEl && chEl.value) params.channels = parseInt(chEl.value);
-  if (!confirm('Restart sensor "'+sensorId+'"? This will briefly disconnect it.')) return;
-  c2Post('/api/c2/restart', params);
+  nodesDragging = false;
+  nodeStatus(sensorId, 'restarting...', 'node-st-warn');
+  c2Post('/api/c2/restart', params).then(d => {
+    if (!d.ok) nodeStatus(sensorId, d.error || 'error', 'node-st-err');
+  });
 }
 
 function c2GetStatus(sensorId) {
-  c2Post('/api/c2/get_status', {sensor_id: sensorId});
+  nodeStatus(sensorId, 'refreshing...', '');
+  c2Post('/api/c2/get_status', {sensor_id: sensorId}).then(d => {
+    if (!d.ok) nodeStatus(sensorId, d.error || 'error', 'node-st-err');
+    else nodeStatus(sensorId, 'ok', 'node-st-ok');
+  });
 }
 
 /* Show slider value live while dragging (label next to slider) */
@@ -3363,11 +3389,15 @@ function renderNodes() {
     let ctrlHtml = '';
     if (n.has_c2) {
       const sid = n.id.replace(/[^a-zA-Z0-9_-]/g,'_');
+      const st = nodeCtrlStatus.get(n.id);
+      const stMsg = st ? st.msg : '';
+      const stCls = st ? ('node-st ' + (st.cls||'')) : 'node-st';
       ctrlHtml = '<div class="node-ctrl">' +
         '<input type="number" id="restart-freq-'+sid+'" placeholder="freq" value="'+(n.center_freq||'')+'" style="width:55px" onfocus="nodesDragging=true" onblur="nodesDragging=false">' +
         '<input type="number" id="restart-ch-'+sid+'" placeholder="ch" value="'+(n.channels||'')+'" style="width:40px" onfocus="nodesDragging=true" onblur="nodesDragging=false">' +
         '<button onclick="c2Restart(\''+n.id+'\')" style="color:#f88">restart</button>' +
-        '<button onclick="c2GetStatus(\''+n.id+'\')">refresh</button></div>';
+        '<button onclick="c2GetStatus(\''+n.id+'\')">refresh</button>' +
+        '<span id="ctrl-st-'+sid+'" class="'+stCls+'">'+stMsg+'</span></div>';
     }
     tr.innerHTML =
       '<td><span class="dot '+dotCls+'"></span>'+esc(n.status)+'</td>' +
