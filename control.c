@@ -388,6 +388,38 @@ static void handle_set_squelch(cJSON *root, const char *req_id) {
     send_response(req_id, "ok", msg);
 }
 
+#ifdef HAVE_GPS
+static void handle_set_gps(cJSON *root, const char *req_id) {
+    cJSON *j_port = cJSON_GetObjectItem(root, "serial_port");
+    if (!cJSON_IsString(j_port)) {
+        send_response(req_id, "error", "missing serial_port");
+        return;
+    }
+    const char *port = j_port->valuestring;
+
+    gps_tag_close();
+
+    int rc;
+    if (port[0] == '\0') {
+        rc = gps_tag_init();
+    } else {
+        rc = gps_tag_init_serial(port);
+    }
+
+    char msg[128];
+    if (rc == 0) {
+        gpsd_active = 1;
+        snprintf(msg, sizeof(msg), "GPS started on %s", port[0] ? port : "gpsd");
+        send_response(req_id, "ok", msg);
+    } else {
+        gpsd_active = 0;
+        snprintf(msg, sizeof(msg), "failed to open GPS: %s", port[0] ? port : "gpsd");
+        send_response(req_id, "error", msg);
+    }
+    fprintf(stderr, "C2: %s\n", msg);
+}
+#endif
+
 static void handle_restart(cJSON *root, const char *req_id) {
     cJSON *j_freq = cJSON_GetObjectItem(root, "center_freq");
     cJSON *j_chan = cJSON_GetObjectItem(root, "channels");
@@ -485,6 +517,10 @@ static void dispatch_command(const void *data, size_t len) {
         send_heartbeat();
     } else if (strcmp(cmd, "restart") == 0) {
         handle_restart(root, req_id);
+#ifdef HAVE_GPS
+    } else if (strcmp(cmd, "set_gps") == 0) {
+        handle_set_gps(root, req_id);
+#endif
     } else {
         send_response(req_id, "error", "unknown command");
     }

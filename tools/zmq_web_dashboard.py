@@ -1739,19 +1739,13 @@ class DashboardState:
             }
 
     def get_connections(self):
-        """Return active BLE connections for display."""
+        """Return all observed BLE connections for display."""
         with self.lock:
             now = time.time()
             result = []
-            stale = []
             for aa, c in self.ble_connections.items():
                 age = now - c["last_seen"]
-                # Expire connections with no data after supervision timeout
-                # (or 60s if unknown)
                 sup_timeout = c.get("timeout_ms", 60000) / 1000.0
-                if age > max(sup_timeout, 60):
-                    stale.append(aa)
-                    continue
                 result.append({
                     "aa": f"0x{aa:08X}",
                     "init_addr": c["init_addr"],
@@ -1763,9 +1757,8 @@ class DashboardState:
                     "data_pkts": c.get("data_pkts", 0),
                     "age": round(age, 1),
                     "created": c.get("created", 0),
+                    "stale": age > max(sup_timeout, 60),
                 })
-            for aa in stale:
-                del self.ble_connections[aa]
             return result
 
     def is_dirty(self):
@@ -3536,10 +3529,10 @@ function renderNodes() {
         ? serialPorts.map(p => '<option value="'+esc(p)+'">'+esc(p)+'</option>').join('')
         : '<option value="" disabled>no ports found</option>';
       gpsHtml = '<div class="node-ctrl" style="white-space:nowrap">' +
-        '<select id="gps-port-'+sid+'" style="max-width:130px;font-size:10px">' +
-        '<option value="">-- serial port --</option>' + opts + '</select>' +
-        '<button onclick="c2SetGps(\''+n.id+'\',document.getElementById(\'gps-port-'+sid+'\').value)" ' +
-        'style="margin-left:3px">set</button></div>';
+        '<select style="max-width:150px;font-size:10px" ' +
+        'onfocus="nodesDragging=true" onblur="nodesDragging=false" ' +
+        'onchange="nodesDragging=false;if(this.value)c2SetGps(\''+n.id+'\',this.value)">' +
+        '<option value="">-- serial port --</option>' + opts + '</select></div>';
     } else {
       gpsHtml = '-';
     }
@@ -3630,8 +3623,8 @@ function renderConnections() {
     const tr = document.createElement('tr');
     const ageStr = c.age < 60 ? Math.round(c.age)+'s' : Math.floor(c.age/60)+'m';
     tr.innerHTML =
-      '<td>'+esc(c.init_addr)+'</td>' +
-      '<td>'+esc(c.adv_addr)+'</td>' +
+      '<td>'+(priv?mask(c.init_addr):esc(c.init_addr))+'</td>' +
+      '<td>'+(priv?mask(c.adv_addr):esc(c.adv_addr))+'</td>' +
       '<td class="dim">'+esc(c.aa)+'</td>' +
       '<td>'+c.interval_ms+'ms</td>' +
       '<td>'+c.hop+'</td>' +

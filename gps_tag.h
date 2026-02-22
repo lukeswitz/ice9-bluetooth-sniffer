@@ -15,6 +15,7 @@ typedef struct _gps_fix_t {
 } gps_fix_t;
 
 int gps_tag_init(void);
+int gps_tag_init_serial(const char *device);
 void gps_tag_close(void);
 void gps_tag_get_fix(gps_fix_t *fix);
 
