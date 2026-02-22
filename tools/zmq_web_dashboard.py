@@ -1133,6 +1133,37 @@ def parse_ble_packet(data):
                 fingerprint = parse_ad_structures(
                     ble_data[adv_data_start:adv_data_end])
 
+    # Parse CONNECT_IND payload for connection tracking
+    conn_info = None
+    if is_adv and pdu_type == 5 and len(ble_data) >= 40:
+        pdu_len = ble_data[5]
+        if pdu_len == 34:
+            init_addr = ":".join(f"{b:02x}" for b in reversed(ble_data[6:12]))
+            adv_addr  = ":".join(f"{b:02x}" for b in reversed(ble_data[12:18]))
+            conn_aa   = struct.unpack_from("<I", ble_data, 18)[0]
+            crc_init  = ble_data[22] | (ble_data[23] << 8) | (ble_data[24] << 16)
+            interval  = struct.unpack_from("<H", ble_data, 28)[0]
+            latency   = struct.unpack_from("<H", ble_data, 30)[0]
+            sup_timeout = struct.unpack_from("<H", ble_data, 32)[0]
+            ch_map    = ble_data[34:39]
+            hop       = ble_data[39] & 0x1F
+            n_ch      = sum(bin(b).count('1') for b in ch_map[:4]) + bin(ch_map[4] & 0x1F).count('1')
+            init_type = (ble_data[4] >> 6) & 1
+            adv_type  = (ble_data[4] >> 7) & 1
+            conn_info = {
+                "init_addr": init_addr,
+                "adv_addr": adv_addr,
+                "init_type": "random" if init_type else "public",
+                "adv_type": "random" if adv_type else "public",
+                "conn_aa": conn_aa,
+                "crc_init": crc_init,
+                "interval_ms": round(interval * 1.25, 2),
+                "latency": latency,
+                "timeout_ms": sup_timeout * 10,
+                "hop": hop,
+                "used_channels": n_ch,
+            }
+
     return {
         "timestamp": ts_sec + ts_usec / 1e6,
         "rf_channel": rf_channel,
@@ -1150,6 +1181,7 @@ def parse_ble_packet(data):
         "data_len": len(ble_data),
         "fingerprint": fingerprint,
         "protocol": "BLE",
+        "conn_info": conn_info,
     }
 
 
@@ -1282,6 +1314,8 @@ class DashboardState:
         # Persistence and alerting (set externally after construction)
         self.db = None          # DeviceDB instance
         self.alert_mgr = None   # AlertManager instance
+        # BLE connection tracking (from CONNECT_IND packets)
+        self.ble_connections = {}  # conn_aa (int) -> connection info dict
         # C2 control state
         self.c2_sensor_status = {}   # sensor_id -> heartbeat data + last_heartbeat
         self.c2_outbox = queue.Queue()  # (sensor_id_bytes, json_bytes) for ROUTER
@@ -1327,7 +1361,29 @@ class DashboardState:
                 else:
                     self.ble_channel_counts[rf_ch] = self.ble_channel_counts.get(rf_ch, 0) + 1
 
+            # Track CONNECT_IND -> connection table
+            conn_info = pkt.get("conn_info")
+            if conn_info:
+                conn_aa = conn_info["conn_aa"]
+                self.ble_connections[conn_aa] = {
+                    **conn_info,
+                    "created": pkt["timestamp"],
+                    "last_seen": pkt["timestamp"],
+                    "data_pkts": 0,
+                }
+
             mac = pkt["mac"]
+
+            # Data channel packets: resolve MAC via connection table
+            if not mac and not pkt["is_adv"]:
+                aa = pkt.get("aa", 0)
+                conn = self.ble_connections.get(aa)
+                if conn:
+                    conn["last_seen"] = pkt["timestamp"]
+                    conn["data_pkts"] = conn.get("data_pkts", 0) + 1
+                    mac = conn["adv_addr"]
+                    pkt["pdu_type"] = "DATA"
+
             if not mac:
                 self.data_packets += 1
                 return
@@ -1514,6 +1570,7 @@ class DashboardState:
                 "crc_invalid": self.crc_invalid,
                 "macs": len(self.devices),
                 "data_pkts": self.data_packets,
+                "connections": len(self.ble_connections),
                 "gps_count": self.gps_count,
                 "last_gps": (list(self.last_gps[:2]) if self.last_gps
                              else (list(self.browser_gps[:2]) if self.browser_gps else None)),
@@ -1680,6 +1737,36 @@ class DashboardState:
                 "ble_channels": sorted(ble_ch_dist.items()),
                 "bt_channels": sorted(bt_ch_dist.items()),
             }
+
+    def get_connections(self):
+        """Return active BLE connections for display."""
+        with self.lock:
+            now = time.time()
+            result = []
+            stale = []
+            for aa, c in self.ble_connections.items():
+                age = now - c["last_seen"]
+                # Expire connections with no data after supervision timeout
+                # (or 60s if unknown)
+                sup_timeout = c.get("timeout_ms", 60000) / 1000.0
+                if age > max(sup_timeout, 60):
+                    stale.append(aa)
+                    continue
+                result.append({
+                    "aa": f"0x{aa:08X}",
+                    "init_addr": c["init_addr"],
+                    "adv_addr": c["adv_addr"],
+                    "interval_ms": c.get("interval_ms", 0),
+                    "latency": c.get("latency", 0),
+                    "hop": c.get("hop", 0),
+                    "used_channels": c.get("used_channels", 0),
+                    "data_pkts": c.get("data_pkts", 0),
+                    "age": round(age, 1),
+                    "created": c.get("created", 0),
+                })
+            for aa in stale:
+                del self.ble_connections[aa]
+            return result
 
     def is_dirty(self):
         with self.lock:
@@ -1992,12 +2079,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 summary = state.get_summary()
                 sensors = state.get_sensors()
                 nodes = state.get_sensor_nodes()
+                conns = state.get_connections()
                 alerts = []
                 if state.alert_mgr:
                     alerts = state.alert_mgr.get_pending_alerts()
                 payload = json.dumps({"stats": stats, "devices": devs,
                                       "summary": summary, "sensors": sensors,
-                                      "nodes": nodes, "alerts": alerts})
+                                      "nodes": nodes, "connections": conns,
+                                      "alerts": alerts})
                 self.wfile.write(f"event: update\ndata: {payload}\n\n".encode())
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionError, OSError):
@@ -2455,6 +2544,7 @@ td[data-col="rssi"] { font-family: 'Menlo', 'Monaco', 'Courier New', monospace; 
   <span>devices: <span class="val" id="sMacs">0</span></span>
   <span>watched: <span class="val" id="sWatched">0</span></span>
   <span>data: <span class="val" id="sData">0</span></span>
+  <span>conns: <span class="val" id="sConns">0</span></span>
   <span>up: <span class="val" id="sUp">0s</span></span>
   <span id="gpsStatus" style="display:none;color:#4af;font-size:10px;margin-left:8px;"></span>
 </div>
@@ -2544,6 +2634,21 @@ td[data-col="rssi"] { font-family: 'Menlo', 'Monaco', 'Courier New', monospace; 
       <tbody id="nodesTb"></tbody>
     </table>
     <div class="empty" id="nodesEmpty">no sensor nodes connected</div>
+    <h3 style="margin:12px 0 4px 0">BLE Connections</h3>
+    <table class="dev-table" style="margin-bottom:0">
+      <thead><tr>
+        <th>initiator</th>
+        <th>advertiser</th>
+        <th>access addr</th>
+        <th>interval</th>
+        <th>hop</th>
+        <th>channels</th>
+        <th>data pkts</th>
+        <th>age</th>
+      </tr></thead>
+      <tbody id="connTb"></tbody>
+    </table>
+    <div class="empty" id="connEmpty">no active connections</div>
   </div>
 </div>
 
@@ -3128,6 +3233,7 @@ function updStats(s) {
   document.getElementById('sCrc').textContent = s.crc_pct!==null ? s.crc_pct+'%' : '--';
   document.getElementById('sMacs').textContent = s.macs;
   document.getElementById('sData').textContent = s.data_pkts.toLocaleString();
+  document.getElementById('sConns').textContent = s.connections || 0;
   document.getElementById('sUp').textContent = fmtUp(s.uptime);
   if (GPS && s.last_gps && map) {
     const ll = s.last_gps;
@@ -3512,6 +3618,32 @@ function renderNodes() {
   ntb.appendChild(frag);
 }
 
+let connectionsData = [];
+
+function renderConnections() {
+  const ctb = document.getElementById('connTb');
+  const empty = document.getElementById('connEmpty');
+  if (!connectionsData.length) { ctb.innerHTML = ''; empty.style.display = 'block'; return; }
+  empty.style.display = 'none';
+  const frag = document.createDocumentFragment();
+  for (const c of connectionsData) {
+    const tr = document.createElement('tr');
+    const ageStr = c.age < 60 ? Math.round(c.age)+'s' : Math.floor(c.age/60)+'m';
+    tr.innerHTML =
+      '<td>'+esc(c.init_addr)+'</td>' +
+      '<td>'+esc(c.adv_addr)+'</td>' +
+      '<td class="dim">'+esc(c.aa)+'</td>' +
+      '<td>'+c.interval_ms+'ms</td>' +
+      '<td>'+c.hop+'</td>' +
+      '<td>'+c.used_channels+'/37</td>' +
+      '<td class="count">'+c.data_pkts.toLocaleString()+'</td>' +
+      '<td class="dim">'+ageStr+'</td>';
+    frag.appendChild(tr);
+  }
+  ctb.innerHTML = '';
+  ctb.appendChild(frag);
+}
+
 es.addEventListener('update', e => {
   const d = JSON.parse(e.data);
   devices = d.devices;
@@ -3519,10 +3651,11 @@ es.addEventListener('update', e => {
   watched.clear();
   for (const dev of (d.devices || [])) { if (dev.is_watched) watched.add(dev.mac); }
   if (d.nodes) nodesData = d.nodes;
+  if (d.connections) connectionsData = d.connections;
   updStats(d.stats);
   renderDevices();
   if (curTab === 'summary') renderSummary(summary);
-  if (curTab === 'nodes') renderNodes();
+  if (curTab === 'nodes') { renderNodes(); renderConnections(); }
   if (d.sensors && map) updateSensors(d.sensors);
   if (devices && map) updateDevicePositions(devices);
   // Browser alerts

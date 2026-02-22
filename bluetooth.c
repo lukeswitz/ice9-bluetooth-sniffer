@@ -56,8 +56,123 @@ static float aa_template_norm;      // pre-computed sqrt(sum(template^2))
 #define MAX(X,Y) ((X) > (Y) ? (X) : (Y))
 #endif
 
+/* -----------------------------------------------------------------------
+ * BLE Connection Table -- tracks active connections from CONNECT_IND
+ * ----------------------------------------------------------------------- */
+static ble_connection_t conn_table[BLE_MAX_CONNECTIONS];
+
+unsigned ble_conn_get_count(void) {
+    unsigned n = 0;
+    for (unsigned i = 0; i < BLE_MAX_CONNECTIONS; i++)
+        if (conn_table[i].active) n++;
+    return n;
+}
+
+const ble_connection_t *ble_conn_get_table(void) {
+    return conn_table;
+}
+
+/* Look up a connection by access address.  Returns pointer or NULL. */
+static ble_connection_t *conn_lookup(uint32_t aa) {
+    for (unsigned i = 0; i < BLE_MAX_CONNECTIONS; i++) {
+        if (conn_table[i].active && conn_table[i].aa == aa)
+            return &conn_table[i];
+    }
+    return NULL;
+}
+
+/* Add or update a connection from a parsed CONNECT_IND. */
+static void conn_add(uint32_t aa, uint32_t crc_init,
+                      const uint8_t *init_addr, const uint8_t *adv_addr,
+                      uint8_t init_type, uint8_t adv_type,
+                      const uint8_t *ch_map, uint8_t hop,
+                      uint16_t interval, uint16_t latency, uint16_t timeout) {
+    /* Check if AA already tracked */
+    ble_connection_t *c = conn_lookup(aa);
+    if (c) {
+        c->last_seen = time(NULL);
+        return;
+    }
+
+    /* Find free slot or evict oldest */
+    unsigned best = 0;
+    time_t oldest = 0;
+    for (unsigned i = 0; i < BLE_MAX_CONNECTIONS; i++) {
+        if (!conn_table[i].active) { best = i; break; }
+        if (!oldest || conn_table[i].last_seen < oldest) {
+            oldest = conn_table[i].last_seen;
+            best = i;
+        }
+    }
+
+    c = &conn_table[best];
+    memset(c, 0, sizeof(*c));
+    c->active = 1;
+    c->aa = aa;
+    c->crc_init = crc_init;
+    memcpy(c->init_addr, init_addr, 6);
+    memcpy(c->adv_addr, adv_addr, 6);
+    c->init_addr_type = init_type;
+    c->adv_addr_type = adv_type;
+    memcpy(c->channel_map, ch_map, 5);
+    c->hop_increment = hop;
+    c->interval = interval;
+    c->latency = latency;
+    c->timeout = timeout;
+    c->created = time(NULL);
+    c->last_seen = c->created;
+}
+
+/* Parse a CONNECT_IND advertising PDU and register the connection.
+ * p->data layout: AA(4) + Header(2) + InitA(6) + AdvA(6) + LLData(22) + CRC(3) = 43 bytes
+ */
+static void parse_connect_ind(ble_packet_t *p) {
+    if (p->aa != BLE_ADV_AA) return;
+    if (p->len < 43) return;
+
+    uint8_t pdu_type = p->data[4] & 0x0F;
+    if (pdu_type != 5) return;
+
+    uint8_t pdu_len = p->data[5];
+    if (pdu_len != 34) return;
+
+    uint8_t init_type = (p->data[4] >> 6) & 1; /* TxAdd */
+    uint8_t adv_type  = (p->data[4] >> 7) & 1; /* RxAdd */
+
+    const uint8_t *init_addr = &p->data[6];     /* bytes 6-11 */
+    const uint8_t *adv_addr  = &p->data[12];    /* bytes 12-17 */
+
+    /* LLData starts at byte 18 */
+    uint32_t conn_aa   = p->data[18] | ((uint32_t)p->data[19] << 8) |
+                         ((uint32_t)p->data[20] << 16) | ((uint32_t)p->data[21] << 24);
+    uint32_t crc_init  = p->data[22] | ((uint32_t)p->data[23] << 8) |
+                         ((uint32_t)p->data[24] << 16);
+    /* byte 25: WinSize (skip) */
+    /* bytes 26-27: WinOffset (skip) */
+    uint16_t interval  = p->data[28] | ((uint16_t)p->data[29] << 8);
+    uint16_t latency   = p->data[30] | ((uint16_t)p->data[31] << 8);
+    uint16_t timeout   = p->data[32] | ((uint16_t)p->data[33] << 8);
+    const uint8_t *ch_map = &p->data[34]; /* bytes 34-38 */
+    uint8_t hop        = p->data[39] & 0x1F;
+
+    conn_add(conn_aa, crc_init, init_addr, adv_addr,
+             init_type, adv_type, ch_map, hop, interval, latency, timeout);
+
+    if (verbose) {
+        fprintf(stderr, "BLE CONNECT_IND: aa=0x%08X crc_init=0x%06X hop=%u interval=%u "
+                "init=%02x:%02x:%02x:%02x:%02x:%02x adv=%02x:%02x:%02x:%02x:%02x:%02x\n",
+                conn_aa, crc_init, hop, interval,
+                init_addr[5], init_addr[4], init_addr[3],
+                init_addr[2], init_addr[1], init_addr[0],
+                adv_addr[5], adv_addr[4], adv_addr[3],
+                adv_addr[2], adv_addr[1], adv_addr[0]);
+    }
+}
+
 // Initialize Bluetooth subsystem (call once at program startup)
 void bluetooth_init(void) {
+    memset(conn_table, 0, sizeof(conn_table));
+
     // Build AA correlation template: +1 for bit=1, -1 for bit=0, repeated SPS times
     uint32_t aa = BLE_ADV_AA;
     float sum_sq = 0;
@@ -241,12 +356,14 @@ static ble_packet_t *ble_burst_correlator(float *demod, unsigned demod_len,
         p->data[i + 4] = byte;
     }
     p->timestamp = timestamp;
+    p->is_data = 0;   /* correlator only finds advertising AA */
+    p->conn_valid = 0;
 
     // CRC validation
     p->crc_checked = 0;
     p->crc_valid = 0;
     if (check_crc) {
-        uint32_t crc_init = (channel >= 37) ? 0x555555 : (BLE_ADV_AA & 0xFFFFFF);
+        uint32_t crc_init = 0x555555;  /* correlator only finds advertising AA */
         unsigned crc_len = p->len - 4 - 3;
         uint32_t computed_crc = ble_crc24(&p->data[4], crc_len, crc_init);
         uint32_t received_crc = p->data[p->len-3] |
@@ -314,48 +431,64 @@ ble_packet_t *ble_burst(uint8_t *bits, unsigned bits_len, unsigned freq, struct 
                 p->data[i+4] = byte;
             }
             p->timestamp = timestamp;
+            p->is_data = (smallest_aa != BLE_ADV_AA) ? 1 : 0;
+            p->conn_valid = 0;
 
             // CRC validation
             p->crc_checked = 0;
             p->crc_valid = 0;
 
             if (check_crc) {
-                unsigned channel = freq_to_channel(freq);
                 uint32_t crc_init;
+                int do_crc = 1;
 
-                if (channel >= 37) {
-                    // Advertising channel: use 0x555555 per BLE spec
+                if (smallest_aa == BLE_ADV_AA) {
+                    // Advertising AA: always use 0x555555 per BLE spec
+                    // This covers primary (ch 37-39) AND secondary/auxiliary
+                    // advertising channels (ch 0-36) used by BLE 5.0+
                     crc_init = 0x555555;
                 } else {
-                    // Data channel: use lower 24 bits of AA directly
-                    crc_init = smallest_aa & 0xFFFFFF;
+                    // Data channel: look up connection for proper CRC init
+                    ble_connection_t *conn = conn_lookup(smallest_aa);
+                    if (conn) {
+                        crc_init = conn->crc_init;
+                        conn->last_seen = time(NULL);
+                        conn->pkt_count++;
+                        p->conn_valid = 1;
+                    } else {
+                        // Unknown connection: CRC init unknown, skip check
+                        // (checking with wrong init just inflates invalid count)
+                        do_crc = 0;
+                    }
                 }
 
-                // Compute CRC over header + payload (excluding AA and CRC)
-                // data[0-3] = AA (skip)
-                // data[4...len-4] = header + payload (include)
-                // data[len-3...len-1] = CRC (skip)
-                unsigned crc_len = p->len - 4 - 3;
-                uint32_t computed_crc = ble_crc24(&p->data[4], crc_len, crc_init);
+                if (do_crc) {
+                    // Compute CRC over header + payload (excluding AA and CRC)
+                    // data[0-3] = AA (skip)
+                    // data[4...len-4] = header + payload (include)
+                    // data[len-3...len-1] = CRC (skip)
+                    unsigned crc_len = p->len - 4 - 3;
+                    uint32_t computed_crc = ble_crc24(&p->data[4], crc_len, crc_init);
 
-                // Extract received CRC (last 3 bytes, LSB first)
-                uint32_t received_crc = p->data[p->len-3] |
-                                       (p->data[p->len-2] << 8) |
-                                       (p->data[p->len-1] << 16);
+                    // Extract received CRC (last 3 bytes, LSB first)
+                    uint32_t received_crc = p->data[p->len-3] |
+                                           (p->data[p->len-2] << 8) |
+                                           (p->data[p->len-1] << 16);
 
-                p->crc_checked = 1;
-                p->crc_valid = (computed_crc == received_crc) ? 1 : 0;
+                    p->crc_checked = 1;
+                    p->crc_valid = (computed_crc == received_crc) ? 1 : 0;
 
-                if (verbose) {
-                    printf("CRC Debug: ch=%u, init=0x%06X, computed=0x%06X, received=0x%06X %s\n",
-                           channel, crc_init, computed_crc, received_crc,
-                           p->crc_valid ? "[VALID]" : "[INVALID]");
-                    printf("  PDU (%u bytes): ", crc_len);
-                    for (unsigned k = 0; k < crc_len && k < 16; k++) {
-                        printf("%02X ", p->data[4+k]);
+                    if (verbose) {
+                        printf("CRC Debug: ch=%u, init=0x%06X, computed=0x%06X, received=0x%06X %s\n",
+                               channel, crc_init, computed_crc, received_crc,
+                               p->crc_valid ? "[VALID]" : "[INVALID]");
+                        printf("  PDU (%u bytes): ", crc_len);
+                        for (unsigned k = 0; k < crc_len && k < 16; k++) {
+                            printf("%02X ", p->data[4+k]);
+                        }
+                        if (crc_len > 16) printf("...");
+                        printf("\n");
                     }
-                    if (crc_len > 16) printf("...");
-                    printf("\n");
                 }
             }
 
@@ -412,6 +545,10 @@ void bluetooth_detect(uint8_t *bits, unsigned len, float *demod, unsigned demod_
             p->rssi_db = (int)roundf(calibrated_rssi);
             p->noise_db = (int)roundf(noise);
             *aa_out = p->aa;
+
+            // Check for CONNECT_IND on advertising channels
+            if (p->aa == BLE_ADV_AA && p->crc_valid)
+                parse_connect_ind(p);
 
             // Track CRC statistics
             if (p->crc_checked) {
