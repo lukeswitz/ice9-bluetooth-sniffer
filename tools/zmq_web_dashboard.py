@@ -2667,7 +2667,7 @@ function switchTab(name) {
   if (name === 'map' && map) map.invalidateSize();
   if (name === 'summary' && summary) renderSummary(summary);
   if (name === 'alerts') loadAlertSettings();
-  if (name === 'nodes') loadSerialPorts();
+  if (name === 'nodes') { renderNodes(); renderConnections(); loadSerialPorts(); }
 }
 
 const _BTN = 'cursor:pointer;background:#333;color:#ccc;border:1px solid #555;border-radius:3px;padding:3px 10px;font-size:11px;';
