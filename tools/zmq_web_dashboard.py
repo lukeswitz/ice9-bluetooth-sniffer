@@ -36,6 +36,7 @@ Requirements:
 """
 
 import argparse
+import glob
 import json
 import math
 import os
@@ -523,6 +524,20 @@ def build_ppi_gps_header(lat, lon, alt, dlt=DLT_BLUETOOTH_LE_LL_WITH_PHDR):
 
 def build_ppi_passthrough_header(dlt=DLT_BLUETOOTH_LE_LL_WITH_PHDR):
     return PPI_HDR.pack(0, 0, PPI_HDR_SIZE, dlt)
+
+
+def list_serial_ports():
+    """Return available serial port device paths on the local host."""
+    patterns = [
+        "/dev/ttyUSB*",
+        "/dev/ttyACM*",
+        "/dev/cu.usbserial*",
+        "/dev/cu.usbmodem*",
+    ]
+    ports = []
+    for pat in patterns:
+        ports.extend(sorted(glob.glob(pat)))
+    return ports
 
 
 # ---------------------------------------------------------------------------
@@ -1799,6 +1814,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._serve_json(state.get_sensors())
         elif path == "/api/nodes":
             self._serve_json(state.get_sensor_nodes())
+        elif path == "/api/serial_ports":
+            self._serve_json(list_serial_ports())
         elif path == "/api/export.csv":
             self._serve_csv()
         elif path == "/api/export.json":
@@ -1890,6 +1907,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._serve_json({"ok": True})
         elif path == "/api/c2/get_status":
             state.send_c2_command(sensor_id, "get_status")
+            self._serve_json({"ok": True})
+        elif path == "/api/c2/set_gps":
+            port = body.get("serial_port", "")
+            valid = (
+                port == ""
+                or port.startswith("/dev/tty")
+                or port.startswith("/dev/cu.")
+            )
+            if not valid:
+                self._serve_json({"ok": False, "error": "invalid serial port"})
+                return
+            state.send_c2_command(sensor_id, "set_gps", {"serial_port": port})
             self._serve_json({"ok": True})
         else:
             self.send_error(404)
@@ -2536,6 +2565,7 @@ function switchTab(name) {
   if (name === 'map' && map) map.invalidateSize();
   if (name === 'summary' && summary) renderSummary(summary);
   if (name === 'alerts') loadAlertSettings();
+  if (name === 'nodes') loadSerialPorts();
 }
 
 const _BTN = 'cursor:pointer;background:#333;color:#ccc;border:1px solid #555;border-radius:3px;padding:3px 10px;font-size:11px;';
@@ -3278,6 +3308,14 @@ let nodesData = [];
 let nodesDragging = false;
 const nodeCtrlStatus = new Map();  /* sensorId -> {msg, cls, timer} */
 const pendingRestart = new Set();  /* sensorIds with unsent freq/ch changes */
+let serialPorts = [];              /* cached list from /api/serial_ports */
+
+function loadSerialPorts() {
+  fetch('/api/serial_ports').then(r => r.json()).then(ports => {
+    serialPorts = ports;
+    if (curTab === 'nodes') renderNodes();
+  }).catch(() => {});
+}
 
 function c2Post(endpoint, body) {
   return fetch(endpoint, {
@@ -3357,6 +3395,15 @@ function c2GetStatus(sensorId) {
   });
 }
 
+function c2SetGps(sensorId, port) {
+  if (!port) return;
+  nodeStatus(sensorId, 'setting gps...', '');
+  c2Post('/api/c2/set_gps', {sensor_id: sensorId, serial_port: port}).then(d => {
+    if (!d.ok) nodeStatus(sensorId, d.error || 'error', 'node-st-err');
+    else nodeStatus(sensorId, 'gps set', 'node-st-ok');
+  });
+}
+
 /* Show slider value live while dragging (label next to slider) */
 function sliderPreview(el, labelId) {
   const lbl = labelId ? document.getElementById(labelId) : el.nextElementSibling;
@@ -3373,7 +3420,23 @@ function renderNodes() {
   for (const n of nodesData) {
     const tr = document.createElement('tr');
     const dotCls = n.status === 'online' ? 'dot-online' : n.status === 'stale' ? 'dot-stale' : 'dot-offline';
-    const gps = (n.lat != null && n.lon != null) ? n.lat.toFixed(4)+', '+n.lon.toFixed(4) : '-';
+    const hasGps = n.lat != null && n.lon != null;
+    let gpsHtml;
+    if (hasGps) {
+      gpsHtml = n.lat.toFixed(4)+', '+n.lon.toFixed(4);
+    } else if (n.has_c2) {
+      const sid = n.id.replace(/[^a-zA-Z0-9_-]/g,'_');
+      const opts = serialPorts.length
+        ? serialPorts.map(p => '<option value="'+esc(p)+'">'+esc(p)+'</option>').join('')
+        : '<option value="" disabled>no ports found</option>';
+      gpsHtml = '<div class="node-ctrl" style="white-space:nowrap">' +
+        '<select id="gps-port-'+sid+'" style="max-width:130px;font-size:10px">' +
+        '<option value="">-- serial port --</option>' + opts + '</select>' +
+        '<button onclick="c2SetGps(\''+n.id+'\',document.getElementById(\'gps-port-'+sid+'\').value)" ' +
+        'style="margin-left:3px">set</button></div>';
+    } else {
+      gpsHtml = '-';
+    }
     const rate = n.pkt_rate != null ? n.pkt_rate.toFixed(1) : '-';
     const crc = n.crc_pct != null ? n.crc_pct.toFixed(1)+'%' : '-';
     const up = n.uptime != null ? fmtUp(n.uptime) : '-';
@@ -3441,7 +3504,7 @@ function renderNodes() {
       '<td>'+rate+'</td>' +
       '<td>'+crc+'</td>' +
       '<td>'+up+'</td>' +
-      '<td class="dim">'+gps+'</td>' +
+      '<td class="dim">'+gpsHtml+'</td>' +
       '<td>'+ctrlHtml+'</td>';
     frag.appendChild(tr);
   }
